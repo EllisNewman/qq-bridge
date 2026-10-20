@@ -27,6 +27,20 @@
       "enabled": true,
       "maxMessages": 100,
       "once": true
+    },
+    "inject": {
+      "bootstrapMaxChars": 1200,
+      "wakeMaxChars": 800,
+      "recallMaxChars": 300,
+      "maxRecallFacts": 3,
+      "maxPinnedFacts": 2,
+      "cooldownMs": 1800000
+    },
+    "facts": {
+      "maxActive": 300
+    },
+    "episodes": {
+      "maxActive": 400
     }
   },
   "snowluma": {

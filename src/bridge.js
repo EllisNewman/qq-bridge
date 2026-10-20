@@ -23,6 +23,7 @@ import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour } from './time.js';
 import { createArchiveStore, buildBackfillEntries, scopeForKey as archiveScopeForKey } from './archive-log.js';
+import { createMemoryStore } from './memory-store.js';
 import { readJsonSafe, atomicWriteJson, atomicWriteText } from './state-io.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
@@ -609,10 +610,24 @@ function loadConfig() {
       const raw = (file.memory && typeof file.memory === 'object' && !Array.isArray(file.memory)) ? file.memory : {};
       const archive = (raw.rawArchive && typeof raw.rawArchive === 'object' && !Array.isArray(raw.rawArchive)) ? raw.rawArchive : {};
       const backfill = (raw.backfill && typeof raw.backfill === 'object' && !Array.isArray(raw.backfill)) ? raw.backfill : {};
+      const inject = (raw.inject && typeof raw.inject === 'object' && !Array.isArray(raw.inject)) ? raw.inject : {};
+      const facts = (raw.facts && typeof raw.facts === 'object' && !Array.isArray(raw.facts)) ? raw.facts : {};
+      const episodes = (raw.episodes && typeof raw.episodes === 'object' && !Array.isArray(raw.episodes)) ? raw.episodes : {};
       return {
         enabled: raw.enabled !== false,
         rawArchive: { enabled: archive.enabled !== false, retentionDays: 0, warnBytes: 104857600, ...archive },
-        backfill: { enabled: backfill.enabled !== false, maxMessages: 100, once: true, ...backfill }
+        backfill: { enabled: backfill.enabled !== false, maxMessages: 100, once: true, ...backfill },
+        inject: {
+          bootstrapMaxChars: 1200,
+          wakeMaxChars: 800,
+          recallMaxChars: 300,
+          maxRecallFacts: 3,
+          maxPinnedFacts: 2,
+          cooldownMs: 1800000,
+          ...inject
+        },
+        facts: { maxActive: 300, ...facts },
+        episodes: { maxActive: 400, ...episodes }
       };
     })(),
     dsh: {
@@ -1342,6 +1357,8 @@ const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no'
 let stateDirHardened = null;
 // M1 私聊原始归档 store：在 main() 里按 cfg 创建；模块级引用供 SIGINT/SIGTERM 落盘。
 let archiveStore = null;
+// M2 长期记忆库：facts/episodes；与 archive 同目录，meta.json 由 archive 管理。
+let memoryStore = null;
 
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
@@ -1350,6 +1367,12 @@ async function main() {
     root: path.join(STATE_DIR, 'archive'),
     metaPath: path.join(STATE_DIR, 'memory', 'meta.json'),
     warnBytes: Number(cfg.memory?.rawArchive?.warnBytes) || 0,
+    log
+  });
+  memoryStore = createMemoryStore({
+    root: path.join(STATE_DIR, 'memory'),
+    metaPath: path.join(STATE_DIR, 'memory', 'meta.json'),
+    maxActiveFacts: Number(cfg.memory?.facts?.maxActive) || 300,
     log
   });
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -4639,7 +4662,8 @@ async function main() {
           sendJson({
             ok: true,
             key,
-            time: new Date().toISOString(),
+            time: formatWithZone(nowMs()),
+            timeMs: nowMs(),
             // 机器人自己的身份：agent 需要它才能把「@樰」对到自己身上（issue #29）。
             self: {
               nickname: selfDisplayName || null,
@@ -4660,6 +4684,16 @@ async function main() {
             currentWakeConfig: st.wakeConfig,
             wakeSafety: computeWakeSafetyV2(st.wakeConfig),
             memory: formatMemoryV2(st),
+            longTermMemory: (() => {
+              const scope = memoryScopeForKey(key);
+              if (!scope) return '';
+              try { return memoryStore.formatForGetPrompt(scope, 2000); } catch { return ''; }
+            })(),
+            longTermStats: (() => {
+              const scope = memoryScopeForKey(key);
+              if (!scope) return null;
+              try { return memoryStore.stats(scope); } catch { return null; }
+            })(),
             participation: formatParticipationV2(st),
             slang: {
               enabled: cfg.slang?.enabled !== false,
@@ -6646,6 +6680,99 @@ async function main() {
           sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
           return;
         }
+        // ── M2 长期记忆：Agent 只读/策展（群聊 403；管理走 /api/memory/*） ──
+        if (req.method === 'POST' && url.pathname.startsWith('/api/socialV2/memory/')) {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
+          const info = archiveScopeForKey(key);
+          if (!info) { sendJson({ ok: false, error: '长期记忆暂仅支持私聊' }, 403); return; }
+          if (!memoryEnabled()) { sendJson({ ok: false, error: '长期记忆已关闭' }, 403); return; }
+          const scope = info.scope;
+          if (url.pathname === '/api/socialV2/memory/search') {
+            sendJson({ ok: true, key, ...memoryStore.search(scope, String(body.query ?? ''), Number(body.limit) || 10) });
+            return;
+          }
+          if (url.pathname === '/api/socialV2/memory/forget') {
+            sendJson({ ok: memoryStore.retract(scope, String(body.id ?? '')), key });
+            return;
+          }
+          if (url.pathname === '/api/socialV2/memory/pin') {
+            sendJson({ ok: memoryStore.pin(scope, String(body.id ?? ''), body.pinned !== false), key });
+            return;
+          }
+          if (url.pathname === '/api/socialV2/memory/stats') {
+            sendJson({ ok: true, key, stats: memoryStore.stats(scope) });
+            return;
+          }
+          sendJson({ ok: false, error: 'not found' }, 404);
+          return;
+        }
+
+        // ── M2 长期记忆：控制台/CLI 管理（带 agent token 的请求一律拒绝） ──
+        if (url.pathname.startsWith('/api/memory/')) {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const body = req.method === 'POST' ? await readBody() : {};
+          const key = String(body.key ?? url.searchParams.get('key') ?? '').trim();
+          const info = key ? archiveScopeForKey(key) : null;
+          if (!key || !info) { sendJson({ ok: false, error: 'key 必须是 private:<QQ>' }, 400); return; }
+          if (!memoryEnabled()) { sendJson({ ok: false, error: '长期记忆已关闭（memory.enabled=false）' }, 403); return; }
+          const scope = info.scope;
+          if (req.method === 'GET' && url.pathname === '/api/memory/scope') {
+            sendJson({
+              ok: true,
+              key,
+              stats: memoryStore.stats(scope),
+              formatted: memoryStore.formatForGetPrompt(scope, 4000),
+              facts: memoryStore.listFacts(scope, { status: 'all', limit: 200 })
+            });
+            return;
+          }
+          if (req.method === 'GET' && url.pathname === '/api/memory/stats') {
+            sendJson({ ok: true, key, stats: memoryStore.stats(scope) });
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/memory/search') {
+            sendJson({ ok: true, key, ...memoryStore.search(scope, String(body.query ?? ''), Number(body.limit) || 10) });
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/memory/fact') {
+            const result = memoryStore.addFact(scope, {
+              kind: body.kind,
+              subject: body.subject,
+              text: body.text,
+              keywords: body.keywords,
+              confidence: body.confidence,
+              salience: body.salience,
+              pinned: body.pinned === true,
+              supersedes: body.supersedes,
+              evidence: body.evidence
+            }, { source: 'operator' });
+            if (!result) { sendJson({ ok: false, error: '新增失败（text 为空或记忆文件只读）' }, 400); return; }
+            sendJson({ ok: true, key, fact: result.fact, updated: result.updated, stats: memoryStore.stats(scope) });
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/memory/forget') {
+            sendJson({ ok: memoryStore.retract(scope, String(body.id ?? '')), key, stats: memoryStore.stats(scope) });
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/memory/pin') {
+            sendJson({ ok: memoryStore.pin(scope, String(body.id ?? ''), body.pinned !== false), key, stats: memoryStore.stats(scope) });
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/memory/import-impressions') {
+            const st = getSocialV2State(key);
+            const result = memoryStore.importImpressions(scope, st.memberImpressions, { dryRun: body.dryRun === true });
+            sendJson({ ok: true, key, dryRun: body.dryRun === true, ...result, stats: memoryStore.stats(scope) });
+            return;
+          }
+          sendJson({ ok: false, error: 'not found' }, 404);
+          return;
+        }
+
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -8770,6 +8897,46 @@ async function main() {
     archiveStore.flushAll();
   }
 
+  function memoryEnabled() {
+    return cfg.memory?.enabled !== false;
+  }
+
+  function memoryScopeForKey(key) {
+    if (!memoryEnabled()) return null;
+    const info = archiveScopeForKey(key);
+    return info ? info.scope : null;
+  }
+
+  function buildLongTermMemoryText(key, opts = {}) {
+    const scope = memoryScopeForKey(key);
+    if (!scope) return '';
+    const inject = cfg.memory?.inject ?? {};
+    const isBootstrap = opts.isBootstrap === true;
+    const maxChars = isBootstrap
+      ? (Number(inject.bootstrapMaxChars) || 1200)
+      : (Number(inject.wakeMaxChars) || 800);
+    try {
+      return memoryStore.selectForInjection(scope, {
+        isBootstrap,
+        messageText: String(opts.messageText ?? ''),
+        maxChars,
+        maxPinnedFacts: Number(inject.maxPinnedFacts) || 2,
+        maxRecallFacts: Number(inject.maxRecallFacts) || 3,
+        cooldownMs: Number(inject.cooldownMs) || 1800000
+      }).text;
+    } catch (error) {
+      log(`[memory] 注入失败 ${key}: ${error?.message ?? error}`);
+      return '';
+    }
+  }
+
+  function formatMemoryContextV2(key, st, opts = {}) {
+    const base = formatMemoryV2(st);
+    if (!key.startsWith('private:') || !memoryEnabled()) return base;
+    const longTerm = buildLongTermMemoryText(key, opts);
+    return longTerm ? [longTerm, base].filter(Boolean).join('\n\n') : base;
+  }
+
   backfillArchive();
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
@@ -10096,7 +10263,12 @@ async function main() {
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
-    const memoryText = formatMemoryV2(st);
+    const lastIncoming = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
+    const lastIncomingText = lastIncoming ? String(lastIncoming.tail || lastIncoming.plain || lastIncoming.text || '') : '';
+    const memoryText = formatMemoryContextV2(key, st, {
+      isBootstrap: reason === 'bootstrap',
+      messageText: lastIncomingText
+    });
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
@@ -10112,7 +10284,7 @@ async function main() {
     const replyTiming = replyTimingV2(st);
     const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
     const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。如果返回里带 preSleepWaitRemainingMs，就按剩余时间继续等待。\n\n`;
-    const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
+    const lastMsg = lastIncoming;
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
     if (lastMsg) statusBits.push(`最近一条来自 ${String(lastMsg.sender || '未知')}：${String(lastMsg.text || lastMsg.plain || '').slice(0, 30)}`);

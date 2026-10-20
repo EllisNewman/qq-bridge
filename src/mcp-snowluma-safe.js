@@ -325,6 +325,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_memory_search: 'memory',
+  qq_memory_forget: 'memory',
+  qq_memory_pin: 'memory',
+  qq_memory_stats: 'memory',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -960,6 +964,95 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `记忆清空失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_search',
+  '检索长期记忆（结论/事件档案，只支持私聊）。轻量记忆（话题/想法/印象）请用 qq_memory_query；长期记忆由人工或蒸馏器沉淀，不是逐条笔记。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    query: z.string().describe('检索词，例如人名、地点、约定、事件关键词'),
+    limit: z.number().optional().describe('最多返回条数，默认 10，最大 50')
+  },
+  async ({ key, token, query, limit }) => {
+    try {
+      const data = await agentApi('/api/socialV2/memory/search', {
+        method: 'POST',
+        body: JSON.stringify({ key, query, limit }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `检索长期记忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_forget',
+  '撤回一条长期记忆（用户明确要求忘记，或确认某条结论是错的时使用）。撤回后不再注入，但记录仍保留在文件里。只支持私聊。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('要撤回的长期记忆 id（来自 qq_memory_search / qq_memory_stats）')
+  },
+  async ({ key, token, id }) => {
+    try {
+      const data = await agentApi('/api/socialV2/memory/forget', {
+        method: 'POST',
+        body: JSON.stringify({ key, id }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `撤回长期记忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_pin',
+  '置顶/取消置顶一条长期记忆。置顶的结论会优先注入，且不受容量淘汰。只支持私聊。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('长期记忆 id'),
+    pinned: z.boolean().optional().describe('true=置顶，false=取消；默认 true')
+  },
+  async ({ key, token, id, pinned }) => {
+    try {
+      const data = await agentApi('/api/socialV2/memory/pin', {
+        method: 'POST',
+        body: JSON.stringify({ key, id, pinned: pinned !== false }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `置顶长期记忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_stats',
+  '查看长期记忆统计：条数、置顶数、已归档数、事件档案数、是否只读降级。只支持私聊。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+  },
+  async ({ key, token }) => {
+    try {
+      const data = await agentApi('/api/socialV2/memory/stats', {
+        method: 'POST',
+        body: JSON.stringify({ key }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取长期记忆统计失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
