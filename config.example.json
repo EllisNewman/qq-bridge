@@ -16,6 +16,19 @@
     "utcOffsetMinutes": 480,
     "label": "UTC+8"
   },
+  "memory": {
+    "enabled": true,
+    "rawArchive": {
+      "enabled": true,
+      "retentionDays": 0,
+      "warnBytes": 104857600
+    },
+    "backfill": {
+      "enabled": true,
+      "maxMessages": 100,
+      "once": true
+    }
+  },
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
     "httpUrl": "http://127.0.0.1:3000",

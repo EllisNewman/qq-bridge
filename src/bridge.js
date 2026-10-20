@@ -22,6 +22,8 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour } from './time.js';
+import { createArchiveStore, buildBackfillEntries, scopeForKey as archiveScopeForKey } from './archive-log.js';
+import { readJsonSafe, atomicWriteJson, atomicWriteText } from './state-io.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
@@ -123,19 +125,6 @@ function settingFromDshNamespace(ns, key) {
   return undefined;
 }
 
-// 读取 JSON 文件并容错：Windows 下常见 UTF-8 BOM（\uFEFF）会令 JSON.parse 失败。
-// required=true 时文件缺失或解析失败直接抛错（用于启动必需配置，fail-fast）。
-function readJsonSafe(file, fallback, required = false) {
-  try {
-    let text = fs.readFileSync(file, 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch (error) {
-    if (required) throw new Error(`配置文件读取/解析失败：${file}（${error?.message ?? error}）`);
-    return fallback;
-  }
-}
-
 /**
  * 读取 config.json，并保证拿到一个**可安全改写的普通对象**。
  *
@@ -156,53 +145,8 @@ function readConfigObject(file) {
   return parsed;
 }
 
-/**
- * 原子替换：`fs.renameSync` 覆盖一个「正被别人打开」的目标，在 Windows 上会抛 EPERM
- * （Defender / 编辑器 / 资源管理器预览 / 云同步都可能在这个窗口里碰它）。
- * 实测本机可复现。这里退避重试几次；实在不行才抛，让调用方决定怎么提示。
- */
-function renameWithRetry(from, to, attempts = 4) {
-  let lastError;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      fs.renameSync(from, to);
-      return;
-    } catch (error) {
-      lastError = error;
-      if (error?.code !== 'EPERM' && error?.code !== 'EBUSY' && error?.code !== 'EACCES') throw error;
-      // 同步忙等一小会儿：调用点大多在启动/收尾路径，不值得为它改成异步。
-      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (i + 1)); } catch {}
-    }
-  }
-  throw lastError;
-}
 
-// 原子写 JSON 文件：先写唯一临时文件再 rename，避免进程中断写坏配置，也避免固定临时名被并发/符号链接攻击利用。
-function atomicWriteJson(file, obj) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-    renameWithRetry(tmp, file);
-  } catch (error) {
-    // 失败时别把随机名临时文件留在 state/ 里当垃圾。
-    try { fs.unlinkSync(tmp); } catch {}
-    throw error;
-  }
-}
 
-// 原子写文本文件。
-function atomicWriteText(file, text) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 });
-    renameWithRetry(tmp, file);
-  } catch (error) {
-    try { fs.unlinkSync(tmp); } catch {}
-    throw error;
-  }
-}
 
 // 控制台鉴权 token：未配置时自动生成并持久化到 state/console-token，避免默认无鉴权。
 function loadOrCreateConsoleToken() {
@@ -660,6 +604,17 @@ function loadConfig() {
       label: 'UTC+8',
       ...((file.time && typeof file.time === 'object' && !Array.isArray(file.time)) ? file.time : {})
     },
+    // 私聊长期记忆（M1 先落原始归档；M2 起再加 facts/episodes）。
+    memory: (() => {
+      const raw = (file.memory && typeof file.memory === 'object' && !Array.isArray(file.memory)) ? file.memory : {};
+      const archive = (raw.rawArchive && typeof raw.rawArchive === 'object' && !Array.isArray(raw.rawArchive)) ? raw.rawArchive : {};
+      const backfill = (raw.backfill && typeof raw.backfill === 'object' && !Array.isArray(raw.backfill)) ? raw.backfill : {};
+      return {
+        enabled: raw.enabled !== false,
+        rawArchive: { enabled: archive.enabled !== false, retentionDays: 0, warnBytes: 104857600, ...archive },
+        backfill: { enabled: backfill.enabled !== false, maxMessages: 100, once: true, ...backfill }
+      };
+    })(),
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
@@ -1385,10 +1340,18 @@ const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no'
 // state/ 的 ACL 是否已收紧（hardenStateDirAcl 的结果；控制台「访问与安全」页会显示，
 // 未收紧时给出可复制的提权命令）。null = 还没跑/平台不适用。
 let stateDirHardened = null;
+// M1 私聊原始归档 store：在 main() 里按 cfg 创建；模块级引用供 SIGINT/SIGTERM 落盘。
+let archiveStore = null;
 
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  archiveStore = createArchiveStore({
+    root: path.join(STATE_DIR, 'archive'),
+    metaPath: path.join(STATE_DIR, 'memory', 'meta.json'),
+    warnBytes: Number(cfg.memory?.rawArchive?.warnBytes) || 0,
+    log
+  });
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -1790,6 +1753,18 @@ async function main() {
     };
     st.recentMessages.push(entry);
     if (st.recentMessages.length > 200) st.recentMessages = st.recentMessages.slice(-200);
+    if (key.startsWith('private:')) {
+      archiveAppend(key, {
+        at: entry.at,
+        dir: 'out',
+        from: selfUserId,
+        name: '我',
+        text: display,
+        plain: display,
+        event: 'voice',
+        mid: entry.messageId
+      });
+    }
     st.lastAiReplyAt = entry.at;
     st.lastActionAt = entry.at;
     st.wakeConfig.noActionCount = 0;
@@ -5380,6 +5355,17 @@ async function main() {
             const pokeText = kind === 'group'
               ? `[拍一拍] 我拍了拍 ${targetUserId}`
               : '[拍一拍] 我拍了拍你';
+            if (key.startsWith('private:')) {
+              archiveAppend(key, {
+                at: Date.now(),
+                dir: 'out',
+                from: selfUserId,
+                name: '我',
+                text: pokeText,
+                plain: pokeText,
+                event: 'poke'
+              });
+            }
             st.recentMessages.push({
               messageId: null,
               sender: '我',
@@ -5771,6 +5757,18 @@ async function main() {
             });
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
             if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+            if (key.startsWith('private:')) {
+              archiveAppend(key, {
+                at: Date.now(),
+                dir: 'out',
+                from: selfUserId,
+                name: '我',
+                text: `[表情包:${label}]`,
+                plain: `[表情包:${label}]`,
+                event: 'sticker',
+                mid: sent.messageId ? String(sent.messageId) : null
+              });
+            }
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -7044,6 +7042,7 @@ async function main() {
             // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
             try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
             try { saveSocialV2State(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
+            try { archiveStore?.flushAll(); } catch (error) { log('重启前归档落盘失败:', error?.message ?? error); }
             releaseLock();
             process.exit(0);
           }, 500);
@@ -7875,6 +7874,17 @@ async function main() {
       return false;
     }
     await sendToQQ(key, text);
+    if (key.startsWith('private:')) {
+      archiveAppend(key, {
+        at: Date.now(),
+        dir: 'out',
+        from: selfUserId,
+        name: '我',
+        text,
+        plain: text,
+        event: 'message'
+      });
+    }
     return true;
   }
 
@@ -8714,6 +8724,53 @@ async function main() {
   }
 
   loadSocialV2State();
+
+  // ── M1 私聊原始归档 ────────────────────────────────────────────────────
+  function archiveEnabled() {
+    return cfg.memory?.enabled !== false && cfg.memory?.rawArchive?.enabled !== false;
+  }
+
+  function archiveAppend(key, entry) {
+    if (!archiveEnabled()) return null;
+    const info = archiveScopeForKey(key);
+    if (!info) return null;
+    try {
+      return archiveStore.append(info.scope, entry);
+    } catch (error) {
+      log(`[archive] 写入失败 ${key}: ${error?.message ?? error}`);
+      return null;
+    }
+  }
+
+  function backfillArchive() {
+    if (!archiveEnabled() || cfg.memory?.backfill?.enabled === false) return;
+    const max = Math.max(1, Math.min(200, Number(cfg.memory?.backfill?.maxMessages) || 100));
+    for (const [key, st] of socialV2.conversations) {
+      if (!key.startsWith('private:')) continue;
+      const info = archiveScopeForKey(key);
+      if (!info) continue;
+      if (archiveStore.getMeta(info.scope).backfilledAt) continue;
+      // 已经有实时归档行（M1 上线后产生的）时不再回填，避免重复。
+      if (archiveStore.stats(info.scope).totalLines > 0) {
+        archiveStore.markBackfilled(info.scope);
+        continue;
+      }
+      const entries = buildBackfillEntries(st.recentMessages, {
+        maxMessages: max,
+        selfUserId,
+        redact: redactKnownTokensOnly
+      });
+      for (const e of entries) {
+        try { archiveStore.append(info.scope, e); }
+        catch (error) { log(`[archive] 回填失败 ${key}: ${error?.message ?? error}`); }
+      }
+      archiveStore.markBackfilled(info.scope);
+      log(`[archive] 已回填 ${key} ${entries.length} 条（backfill=true）`);
+    }
+    archiveStore.flushAll();
+  }
+
+  backfillArchive();
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
 
@@ -9719,6 +9776,18 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    if (key.startsWith('private:')) {
+      archiveAppend(key, {
+        at: msg.time,
+        dir: 'in',
+        from: userId != null ? String(userId) : '',
+        name: actor,
+        text,
+        plain: text,
+        event: 'poke',
+        msgSeq: msg.seq
+      });
+    }
     saveSocialV2State();
     return msg;
   }
@@ -9742,6 +9811,20 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    if (key.startsWith('private:')) {
+      for (let i = 0; i < list.length; i++) {
+        const sentText = redactKnownTokensOnly(String(list[i] ?? ''));
+        archiveAppend(key, {
+          at: now + i * 1000,
+          dir: 'out',
+          from: selfUserId,
+          name: '我',
+          text: sentText,
+          plain: sentText,
+          event: 'message'
+        });
+      }
+    }
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -10675,6 +10758,25 @@ async function main() {
         return;
       }
       // 其余 / 开头内容照常发给 DSH（DSH 的斜杠命令原样执行，如 /model）
+    }
+
+    // M1 原始归档：与模式无关，私聊所有入站消息都记一份（群聊 scopeForKey 返回 null）。
+    if (archiveEnabled() && key.startsWith('private:')) {
+      const stForSeq = socialV2.conversations.get(key);
+      const archiveSender = event.sender?.nickname || event.sender?.card || String(event.user_id ?? '');
+      archiveAppend(key, {
+        at: Date.now(),
+        msgSeq: currentMode === 'reserved2' ? ((stForSeq?.lastUnreadSeq || 0) + 1) : null,
+        mid: messageRef || null,
+        dir: 'in',
+        from: event.user_id != null ? String(event.user_id) : '',
+        name: archiveSender,
+        text: redactKnownTokensOnly(textContent),
+        plain: redactKnownTokensOnly(plainContent),
+        media: mediaList.slice(0, 8).map((m) => (m?.summary ? `${m.kind || 'image'}:${String(m.summary).slice(0, 80)}` : String(m?.kind || 'image'))),
+        event: 'message',
+        quote: null
+      });
     }
 
     // 二代仿真模式（reserved2）：唤醒调度
@@ -11747,11 +11849,13 @@ async function main() {
 process.on('SIGINT', () => {
   log('退出中…');
   saveState();
+  try { archiveStore?.flushAll(); } catch {}
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   saveState();
+  try { archiveStore?.flushAll(); } catch {}
   releaseLock();
   process.exit(0);
 });
@@ -11774,7 +11878,10 @@ process.on('uncaughtException', (error) => {
   releaseLock();
   process.exit(1);
 });
-process.on('exit', () => releaseLock());
+process.on('exit', () => {
+  try { archiveStore?.flushAll(); } catch {}
+  releaseLock();
+});
 
 main().catch((error) => {
   console.error('[bridge] 启动失败:', error);
