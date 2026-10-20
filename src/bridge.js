@@ -21,6 +21,7 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
+import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour } from './time.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
@@ -615,8 +616,8 @@ function unquoteJsonString(value) {
 // QQ 活动日志：每次收发都追加一行，供 WebUI 侧 agent 汇报 QQ 动态。
 const appendActivityLog = createCappedLogger(ACTIVITY_LOG, 500);
 function appendActivity(line) {
-  // 本地时间：此前用 toISOString() 写的是 UTC，日志时间与本地时间差 8 小时，排查时对不上。
-  appendActivityLog(`[${localClock()}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
+  // 配置时区（默认 UTC+8）的完整日期时间；此前用容器本地 UTC 且没有日期，跨天排查对不上。
+  appendActivityLog(`[${formatDateTime()}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
 }
 
 // 读取角色/模式状态：{"role": "傲娇助手", "mode": "active"|"silent"}
@@ -653,6 +654,12 @@ function loadConfig() {
   const file = readJsonSafe(p, null, true);
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
+    // 统一时间标准：存储用 epoch ms；展示/判定用此偏移（默认 UTC+8）。
+    time: {
+      utcOffsetMinutes: 480,
+      label: 'UTC+8',
+      ...((file.time && typeof file.time === 'object' && !Array.isArray(file.time)) ? file.time : {})
+    },
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
@@ -998,6 +1005,9 @@ function loadConfig() {
     log(`人格注入上限已按范围校正为 ${roleInjectMaxChars} 字符（配置值 ${cfg.role.maxInjectChars}，允许 1000~20000）`);
   }
 
+  // 统一时间标准：存储/比较用 epoch ms（UTC），展示/判定用配置时区（默认 UTC+8）。
+  cfg.time = configureTime(cfg.time);
+
   return cfg;
 }
 
@@ -1187,11 +1197,9 @@ function createCappedLogger(file, maxLines) {
   };
 }
 
-/** 本地时间 HH:MM:SS。此前用的是 toISOString()，写进日志的是 UTC，和本地时间差 8 小时。 */
+/** 配置时区的 HH:MM:SS（兼容旧调用；新代码请直接用 time.js 的 formatDateTime/formatWithZone）。 */
 function localClock(atMs = Date.now()) {
-  const d = new Date(atMs);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return formatClock(atMs);
 }
 
 const appendBridgeLog = createCappedLogger(BRIDGE_LOG, 2000);
@@ -1203,9 +1211,9 @@ function log(...args) {
       .map((a) => redactSensitiveText(typeof a === 'string' ? a : JSON.stringify(a)))
       .join(' ')
       .replace(/[\r\n]+/g, ' ');
-    line = `${localClock()} [bridge] ${body.length > LOG_LINE_MAX ? `${body.slice(0, LOG_LINE_MAX)}…[截断]` : body}`;
+    line = `${formatDateTime()} [bridge] ${body.length > LOG_LINE_MAX ? `${body.slice(0, LOG_LINE_MAX)}…[截断]` : body}`;
   } catch {
-    line = `${localClock()} [bridge] (日志参数无法序列化)`;
+    line = `${formatDateTime()} [bridge] (日志参数无法序列化)`;
   }
   // console.log 必须自成一个 try：stdout 的读者（守护窗口）消失时会抛 EPIPE，
   // 而 log() 是从 socket 事件回调里被调用的 —— 一旦抛出就会变成未捕获异常把进程带走。
@@ -2298,8 +2306,7 @@ async function main() {
   }
 
   function withSlangContext(promptText) {
-    const now = new Date();
-    const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
+    const timeLine = `【当前时间】${formatWithZone(nowMs())}`;
     const parts = [timeLine];
     if (cfg.slang?.enabled !== false) {
       const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
@@ -10032,7 +10039,7 @@ async function main() {
     const wc = st.wakeConfig || {};
     const wcTr = wc.triggers || {};
     const wcMode = wc.mode === 'active' ? '活跃' : '潜水';
-    const wcTime = wc.infinite ? '无限' : (wc.sleepUntil && Number.isFinite(Date.parse(wc.sleepUntil)) ? `有限至 ${new Date(wc.sleepUntil).toLocaleString()}` : '未设时间');
+    const wcTime = wc.infinite ? '无限' : (wc.sleepUntil && Number.isFinite(Date.parse(wc.sleepUntil)) ? `有限至 ${formatWithZone(parseTime(wc.sleepUntil))}` : '未设时间');
     const wcTriggers = [];
     if (wcTr.atMention) wcTriggers.push('@');
     if (wcTr.nameMention) wcTriggers.push('名字');
@@ -10448,8 +10455,8 @@ async function main() {
       const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
       if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
-      const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
+      // 静默时段按配置时区（默认 UTC+8）判断；旧代码用容器本地小时，容器是 UTC 时昼夜是反的。
+      if (isQuietHour(nowMs(), 23, 8)) prob *= 0.3;
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;

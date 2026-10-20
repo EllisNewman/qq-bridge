@@ -12,6 +12,10 @@
   "role": {
     "maxInjectChars": 6000
   },
+  "time": {
+    "utcOffsetMinutes": 480,
+    "label": "UTC+8"
+  },
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
     "httpUrl": "http://127.0.0.1:3000",
