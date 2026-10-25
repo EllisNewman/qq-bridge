@@ -21,6 +21,7 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
+import { createConversationContext, contextPreview, recentExchangeGroups, orderContextMessages } from './conversation-context.js';
 import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour } from './time.js';
 import { createArchiveStore, buildBackfillEntries, scopeForKey as archiveScopeForKey } from './archive-log.js';
 import { createMemoryStore } from './memory-store.js';
@@ -832,7 +833,7 @@ function loadConfig() {
         contextWindow: 20,
         inlineWakeMessages: true,
         wakeMessageLimit: 12,
-        wakeRecentLimit: 4,
+        wakeRecentLimit: 4, // 最近问答组数；每组优先保留来信，回复最多预览四条
         wakeMaxChars: 6000
       },
       // 操作者在控制台为单个会话预写的「初始提示词」的字数上限（只在首次唤醒时注入一次）。
@@ -1359,6 +1360,7 @@ let stateDirHardened = null;
 let archiveStore = null;
 // M2 长期记忆库：facts/episodes；与 archive 同目录，meta.json 由 archive 管理。
 let memoryStore = null;
+const conversationContext = createConversationContext(path.join(STATE_DIR, 'context'), log);
 
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
@@ -6194,6 +6196,19 @@ async function main() {
             // the model should complete sleep observation before its first reply.
             ...(!replyWait ? { preSleepWaitMs, preSleepWaitRemainingMs: preSleepRemainingMs } : {}),
             newMessages,
+            ...(v2ToolEnabled('getRecent') && newMessages.length ? { recent: (() => {
+              const groups = recentExchangeGroups(st.recentMessages, newMessages, 2);
+              const result = [];
+              const ids = new Set();
+              for (const group of groups) for (const msg of group) {
+                const id = msg.contextRef || msg;
+                if (ids.has(id)) continue;
+                const candidate = [...result, compactModelMessage(msg)];
+                if (JSON.stringify(candidate).length > 2000) break;
+                result.push(compactModelMessage(msg)); ids.add(id);
+              }
+              return orderContextMessages(result, st.recentMessages);
+            })() } : {}),
             readThroughSeq,
             unreadCount: st.unread.length
           });
@@ -6354,6 +6369,35 @@ async function main() {
           const id = Number(keyMatch[2]);
           try {
             const st = getSocialV2State(key);
+            if (url.searchParams.get('full') === 'true') {
+              const original = conversationContext.find(key, st.agentToken, messageId);
+              if (!original) { sendJson({ ok: true, key, found: false, error: '原文不在当前会话保留范围内；旧消息不会从预览补写成全文' }); return; }
+              const rawOffset = url.searchParams.get('offset') ?? '0';
+              const rawLimit = url.searchParams.get('limit') ?? '2000';
+              const offset = Number(rawOffset), limit = Number(rawLimit);
+              if (!Number.isSafeInteger(offset) || offset < 0 || offset > original.text.length || !Number.isSafeInteger(limit) || limit < 1 || limit > 4000) {
+                sendJson({ ok: false, error: 'offset 必须为非负整数，limit 必须为 1~4000 的整数' }, 400); return;
+              }
+              let end = Math.min(original.text.length, offset + limit);
+              if (offset > 0 && /[\uDC00-\uDFFF]/.test(original.text[offset] || '') && /[\uD800-\uDBFF]/.test(original.text[offset - 1])) {
+                sendJson({ ok: false, error: 'offset 不能位于 Unicode 代理对中间，请使用 nextOffset' }, 400); return;
+              }
+              if (end < original.text.length && /[\uDC00-\uDFFF]/.test(original.text[end])) end -= 1;
+              if (end === offset && offset < original.text.length) end = Math.min(original.text.length, offset + 2);
+              const text = original.text.slice(offset, end);
+              // A paged read does not authorize clearing the remaining unseen body.
+              if (req.headers['x-agent-token'] && conversationContext.read(key, st.agentToken, original, offset, end)) {
+                noteModelMessagesV2(st, [original]);
+              }
+              sendJson({ ok: true, key, found: true, info: {
+                contextRef: original.contextRef, sender: original.sender, isSelf: original.isSelf,
+                text, offset, nextOffset: end < original.text.length ? end : null,
+                totalChars: original.text.length, originalChars: original.originalChars,
+                originalTruncated: original.originalTruncated, textTruncated: offset > 0 || end < original.text.length,
+                contextInputSeq: original.contextInputSeq ?? null
+              }, readThroughSeq: readThroughSeqV2(st) });
+              return;
+            }
             const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === messageId || (m.messageId && String(m.messageId) === messageId)));
             const forwardFields = found ? {
               forwardIds: Array.isArray(found.forwardIds) ? found.forwardIds : [],
@@ -9188,7 +9232,7 @@ async function main() {
       promptText = buildWakePromptV2(key, opts.wakeReason);
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
-        promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
+        promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\nrecent 是历史预览，可能包含省略，不能当成全文或用户事实；contextInputSeq 仅指发送时最后已展示的来信。textTruncated=true 时不得假定缺失部分；需要细节用 qq_get_message_detail(messageId=contextRef, full=true, offset=0)，按 nextOffset 继续读取；找不到则说明缺失。先保持问题与回复的关系，用户纠正优先于接梗。partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
       }
     }
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
@@ -9867,7 +9911,19 @@ async function main() {
         }
       }
     }
+    const original = conversationContext.append(key, st.agentToken, {
+      seq: (st.lastUnreadSeq || 0) + 1,
+      messageId: messageId != null ? String(messageId) : null,
+      sender, userId: userId != null ? String(userId) : null, isSelf: false,
+      text: redactKnownTokensOnly(String(textContent)), time: Date.now()
+    });
+    const quoted = conversationContext.quoted(key, st.agentToken, textContent, quoteTargetIsSelf);
     const msg = {
+      contextRef: original.contextRef,
+      textTruncated: String(textContent).length > 200,
+      originalChars: original.originalChars,
+      originalTruncated: original.originalTruncated,
+      ...(quoted ? { quoteRef: quoted.contextRef } : {}),
       seq: (st.lastUnreadSeq || 0) + 1,
       messageId: messageId != null ? String(messageId) : null,
       sender,
@@ -9965,8 +10021,19 @@ async function main() {
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
     for (let i = 0; i < list.length; i++) {
-      const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
+      const fullText = redactKnownTokensOnly(String(list[i] ?? ''));
+      const contextInputSeq = readThroughSeqV2(st);
+      const original = conversationContext.append(key, st.agentToken, {
+        sender: '我', isSelf: true, text: fullText, time: now + i * 1000, contextInputSeq
+      });
+      const preview = contextPreview(original);
+      const text = preview.text;
       st.recentMessages.push({
+        contextRef: original.contextRef,
+        contextInputSeq,
+        textTruncated: !!preview.textTruncated,
+        originalChars: original.originalChars,
+        originalTruncated: original.originalTruncated,
         sender: '我',
         text,
         plain: text,
@@ -10143,7 +10210,7 @@ async function main() {
   // Keep this receipt in memory: after a restart the model must fetch unread again.
   function readThroughSeqV2(st, additional = []) {
     const seen = new Set(st.modelSeenSeqs || []);
-    for (const msg of additional) if (Number.isSafeInteger(msg?.seq) && msg.seq > 0) seen.add(msg.seq);
+    for (const msg of additional) if (!msg?.textTruncated && Number.isSafeInteger(msg?.seq) && msg.seq > 0) seen.add(msg.seq);
     const seqs = st.unread.map((m) => m.seq).filter((seq) => Number.isSafeInteger(seq) && seq > 0);
     const lowestBuffered = seqs.length ? Math.min(...seqs) : Infinity;
     const lastUnread = Number.isSafeInteger(st.lastUnreadSeq) ? st.lastUnreadSeq : 0;
@@ -10162,7 +10229,7 @@ async function main() {
     const unread = new Set(st.unread.map((m) => m.seq));
     st.modelSeenSeqs = new Set([...st.modelSeenSeqs || []].filter((seq) => unread.has(seq)));
     for (const msg of messages) {
-      if (Number.isSafeInteger(msg?.seq) && msg.seq > 0 && unread.has(msg.seq)) st.modelSeenSeqs.add(msg.seq);
+      if (!msg?.textTruncated && Number.isSafeInteger(msg?.seq) && msg.seq > 0 && unread.has(msg.seq)) st.modelSeenSeqs.add(msg.seq);
     }
     return readThroughSeqV2(st);
   }
@@ -10223,10 +10290,33 @@ async function main() {
       for (const msg of st.unread.slice(0, maxUnread)) if (!tryAdd('messages', msg)) break;
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
-      const unread = new Set(st.unread.map((m) => m.seq));
-      const recent = st.recentMessages.filter((m) => !Number.isSafeInteger(m.seq) || !unread.has(m.seq)).slice(-maxRecent);
-      for (const msg of recent.reverse()) if (!tryAdd('recent', msg)) break;
-      packet.recent.reverse();
+      const selected = new Set();
+      // Explicit quote context has priority over unrelated recent bubbles.
+      const related = [];
+      for (const msg of packet.messages) {
+        if (!msg.quoteRef) continue;
+        const quote = conversationContext.find(key, st.agentToken, msg.quoteRef);
+        if (!quote) continue;
+        const input = quote.contextInputSeq
+          ? st.recentMessages.find((m) => !m.isSelf && m.seq === quote.contextInputSeq)
+            ?? conversationContext.find(key, st.agentToken, String(quote.contextInputSeq)) : null;
+        related.push([input, quote].filter(Boolean));
+      }
+      const groups = [...related, ...recentExchangeGroups(st.recentMessages, st.unread, maxRecent)];
+      const pendingSeqs = new Set(st.unread.map((m) => m.seq));
+      for (const group of groups) {
+        for (const msg of group) {
+          // Quote expansion must not bypass the unread tool or skip its cursor.
+          if (Number.isSafeInteger(msg.seq) && pendingSeqs.has(msg.seq)) continue;
+          const id = msg.contextRef || msg;
+          if (selected.has(id)) continue;
+          // Keep legacy previews untouched; originals expand only by explicit read.
+          const preview = msg.contextRef && !st.recentMessages.includes(msg) ? contextPreview(msg) : msg;
+          if (tryAdd('recent', preview)) selected.add(id);
+          else break; // never add a group's replies when its question did not fit
+        }
+      }
+      orderContextMessages(packet.recent, st.recentMessages);
     }
     return packet;
   }
@@ -10274,7 +10364,7 @@ async function main() {
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
-    const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    const antiAiLine = '【对话理解】先保持用户已说明的目标、经历和约束，再选择语气。比较体验不等于选择目的地；用户纠正时先更新理解，接梗不能代替纠错。人格只影响表达，不允许歪曲事实或任务前提。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`

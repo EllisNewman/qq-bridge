@@ -192,6 +192,22 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
       assert.equal(requests.length, before);
     }
 
+    await client.callTool({ name: 'qq_get_message_detail', arguments: {
+      ...common, messageId: 'ctx_fixture', full: true, offset: 2000, limit: 1000,
+    } });
+    const detailUrl = new URL(requests.at(-1).url, 'http://fixture');
+    assert.equal(detailUrl.searchParams.get('messageId'), 'ctx_fixture');
+    assert.equal(detailUrl.searchParams.get('full'), 'true');
+    assert.equal(detailUrl.searchParams.get('offset'), '2000');
+    assert.equal(detailUrl.searchParams.get('limit'), '1000');
+    assert.equal(requests.at(-1).token, common.token);
+    for (const options of [{ offset: -1 }, { limit: 4001 }, { full: 'true' }]) {
+      const before = requests.length;
+      const invalid = await client.callTool({ name: 'qq_get_message_detail', arguments: { ...common, messageId: 'ctx_fixture', ...options } });
+      assert.equal(invalid.isError, true);
+      assert.equal(requests.length, before);
+    }
+
     // Omission preserves the old wait contract, while reply explicitly selects
     // the short pre-reply quiet window. Both travel through the real MCP schema.
     await client.callTool({ name: 'qq_wait_for_messages', arguments: common });

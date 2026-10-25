@@ -838,15 +838,18 @@ server.tool(
 
 server.tool(
   'qq_get_message_detail',
-  '按 message_id / 本地 seq 查看单条消息的发送者、引用信息与正文（只读）。注意：正文最多返回 200 字符，textTruncated=true 表示被截断，这里不是读取长消息全文的入口。',
+  '查看消息预览，或用 full=true 按 contextRef 分段读取当前会话保存的原文。预览最多 200 字；full 模式按 nextOffset 继续，直到 null。originalTruncated=true 表示原文超过保存上限，不得猜补。原文找不到时如实说明。此工具只读，不代替 QQ 引用发送所需的真实 messageId。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    messageId: z.union([z.number(), z.string()]).describe('要查看的消息 id（QQ 消息 id 可能为负数）')
+    messageId: z.union([z.number(), z.string()]).describe('contextRef / QQ messageId / 本地来信 seq；全文优先使用 contextRef'),
+    full: z.boolean().optional().describe('true=分段读取保存的原文；默认仅预览'),
+    offset: z.number().int().min(0).optional().describe('全文起始字符位置，后续使用 nextOffset'),
+    limit: z.number().int().min(1).max(4000).optional().describe('全文每段字符数，默认 2000')
   },
-  async ({ key, token, messageId }) => {
+  async ({ key, token, messageId, full = false, offset = 0, limit = 2000 }) => {
     try {
-      const data = await agentApi(`/api/socialV2/message-detail?key=${encodeURIComponent(key)}&messageId=${encodeURIComponent(String(messageId))}`, { headers: { 'x-agent-token': token } });
+      const data = await agentApi(`/api/socialV2/message-detail?key=${encodeURIComponent(key)}&messageId=${encodeURIComponent(String(messageId))}&full=${full}&offset=${offset}&limit=${limit}`, { headers: { 'x-agent-token': token } });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `获取消息详情失败：${error?.message ?? error}` }], isError: true };

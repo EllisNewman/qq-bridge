@@ -19,6 +19,12 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as conversationContext from '../src/conversation-context.js';
+import * as stateIO from '../src/state-io.js';
+import * as time from '../src/time.js';
+import * as archive from '../src/archive-log.js';
+import * as memory from '../src/memory-store.js';
+import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -160,7 +166,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...conversationContext, ...stateIO, ...time, ...archive, ...memory, ...roleCard, archiveScopeForKey: archive.scopeForKey,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

@@ -44,6 +44,14 @@
 | 动态 ACL | `resolveVoicePathForV2()` / `voicePathInsideLibrary()` | 语音只能取语音库目录内的文件；贴纸只能发收藏库内的表情；图片只能读 SnowLuma home 内的本地文件（realpath 复核防符号链接逃逸） |
 | **只探测、不部署**（L6 设计不变量） | `mcp-host-server.js` | 该 MCP server **只提供 `snowluma_status`（只读探活 `get_login_info`）**。⚠️ **v0.1.5 起删除了 `start_snowluma` / `stop_snowluma` 与 `snowluma.allowProcessControl`**：SnowLuma EULA §5.4 规定「将其并入第三方安装包或 Docker 镜像、**通过自动化脚本部署**」须事先书面授权，原生组件属**专有组件**。⇒ 本程序不安装、不复制、不打包、不程序化启停 SnowLuma；用户自行安装与启动。详见 `LICENSE` 与 `QSH-plan/QSH_PLAN.md` §6.0 |
 
+### 2.1 会话原文回取
+
+`qq_get_message_detail(full=true)` 沿用会话 token、模式、会话白名单与 `getMessageDetail` 开关；只从当前 key + token 代际的 `state/context/` 缓存读取，不接受文件路径，不查其他会话或旧代际。内部 `contextRef` 不能用于 QQ 引用发送。文本引用只在当前会话唯一匹配时提供关联。
+
+缓存写入前脱敏已知 agent token，按受限权限原子保存；每代际最近 200 条、单条最多 64000 UTF-16 码元，明确标记截断。旧代际文件不自动清理，由管理员按保留策略删除。该缓存不是永久归档，正文读取失败不能回退到伪造全文。
+
+分段读取只更新进程内阅读凭证；只有连续覆盖完整入站原文才推进已读水位。控制台读取、截断预览、历史补充不能授权清除未读。原文中任意凭据的语义检测不在本机制能力内，仍适用下文 R1。
+
 ### 3. 出站内容（模型能说什么、能发什么）
 
 | 机制 | 位置 | 行为 |
