@@ -154,6 +154,48 @@ try {
   ok('只读时拒绝写入', () => assert.equal(s6.addFact(scope, { kind: 'event', text: 'x' }), null));
   ok('不覆盖原文件', () => assert.equal(fs.readFileSync(s5.filePath(scope), 'utf8'), before));
 
+  console.log('[memory] episodes / rolling / handoff / seq');
+  const sEp = newStore(20);
+  const epScope = 'private:555666';
+  const ep1 = sEp.addEpisode(epScope, { summary: '聊了白米饭', participants: ['Ellis'], keywords: ['白米饭'], seqFrom: 1, seqTo: 5 });
+  const ep2 = sEp.addEpisode(epScope, { summary: '聊了白米饭', participants: ['Bot'], keywords: ['米饭'], seqFrom: 6, seqTo: 9 });
+  ok('episode 新增', () => assert.equal(ep1.updated, false));
+  ok('episode 去重合并', () => {
+    assert.equal(ep2.updated, true);
+    assert.equal(sEp.listEpisodes(epScope).length, 1);
+    assert.equal(sEp.listEpisodes(epScope)[0].seqTo, 9);
+  });
+  ok('setRolling', () => {
+    assert.equal(sEp.setRolling(epScope, '最近在聊吃的', 9), true);
+    assert.equal(sEp.snapshot(epScope).rolling.text, '最近在聊吃的');
+  });
+  ok('setHandoff', () => {
+    assert.equal(sEp.setHandoff(epScope, '交接一下', 'session-x'), true);
+    assert.equal(sEp.snapshot(epScope).handoff.fromSessionId, 'session-x');
+  });
+  ok('setSummarizedThroughSeq 单调', () => {
+    sEp.setSummarizedThroughSeq(epScope, 9);
+    sEp.setSummarizedThroughSeq(epScope, 3);
+    assert.equal(sEp.snapshot(epScope).summarizedThroughSeq, 9);
+  });
+  ok('dropFacts', () => {
+    const f = sEp.addFact(epScope, { kind: 'event', text: '旧结论', keywords: ['旧'] }).fact;
+    assert.equal(sEp.dropFacts(epScope, [f.id]), 1);
+    assert.equal(sEp.listFacts(epScope).some((x) => x.id === f.id), false);
+  });
+
+  console.log('[memory] invalidate 后重新读盘');
+  ok('invalidate 丢弃缓存', () => {
+    const scopeInv = 'private:777888';
+    const sInv = newStore(20);
+    sInv.addFact(scopeInv, { kind: 'event', text: '缓存事实' });
+    const file = sInv.filePath(scopeInv);
+    assert.equal(fs.existsSync(file), true);
+    fs.rmSync(file);
+    sInv.invalidate(scopeInv);
+    assert.equal(sInv.load(scopeInv).facts.length, 0);
+  });
+
   console.log('[memory] conv 变化');
   writeMeta('c_one');
   const s7 = newStore(20);

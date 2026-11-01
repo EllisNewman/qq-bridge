@@ -67,10 +67,11 @@ for (const name of PRESETS) {
   const row = load(patchFileFor(name))[0].insert[0];
   const guard = row.config.plugins.find((r) => r.id === 'qq-tool-restrict');
   ok(guard !== undefined, `${name}: 有 qq-tool-restrict 守卫行`);
-  ok(guard?.name === GUARD_SPECIFIER, `${name}: 守卫行 name = ${GUARD_SPECIFIER}`);
+  const expectedGuard = name === 'qq-memory' ? 'qq-agent-presets/qq-memory-guard.mjs' : GUARD_SPECIFIER;
+  ok(guard?.name === expectedGuard, `${name}: 守卫行 name = ${expectedGuard}`);
   const bad = row.config.plugins.filter((r) => typeof r.name === 'string' && (r.name.startsWith('.') || path.isAbsolute(r.name)));
   ok(bad.length === 0, `${name}: 没有任何相对/绝对路径子行名（0.1.7 下会按 profile 目录解析而装不上）${bad.length ? `：${bad.map((r) => r.name).join(', ')}` : ''}`);
-  const guardFile = path.join(BUNDLE_DIR, GUARD_SPECIFIER.slice('qq-agent-presets/'.length));
+  const guardFile = path.join(BUNDLE_DIR, expectedGuard.slice('qq-agent-presets/'.length));
   ok(fs.existsSync(guardFile), `${name}: 守卫实现存在（${path.relative(REPO_ROOT, guardFile)}）`);
 }
 
@@ -93,6 +94,9 @@ console.log('## 4. bundle 声明与安全边界');
   // 一份实现：两个 preset 目录下的同名文件必须是 re-export 壳，且导出同名成员。
   const canonicalMod = await import(pathToFileURL(canonical).href);
   for (const name of PRESETS) {
+    // qq-memory 是零工具 preset：它挂的是 qq-memory-guard，不是 QQ 动作白名单，
+    // 因此没有 qq-tool-restrict re-export 壳。
+    if (name === 'qq-memory') continue;
     const shim = path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'qq-tool-restrict.mjs');
     ok(/^export \* from '\.\.\/\.\.\/\.\.\/plugins\/qq-agent-presets\/qq-tool-restrict\.mjs'$/m.test(read(shim).trim()),
       `${name}/qq-tool-restrict.mjs 是指向唯一实现的 re-export 壳`);
@@ -101,6 +105,9 @@ console.log('## 4. bundle 声明与安全边界');
     assert.equal(shimMod.name, 'qq-tool-restrict');
     assert.deepEqual(shimMod.inject, ['tools']);
   }
+  ok(fs.existsSync(path.join(BUNDLE_DIR, 'qq-memory-guard.mjs')), 'qq-memory-guard 存在');
+  ok(read(path.join(REPO_ROOT, 'dsh', 'agent-presets', 'qq-memory', 'agent.cordis.yml')).includes('qq-memory-guard.mjs'),
+    'qq-memory preset 挂了零工具守卫');
   ok(true, 're-export 壳与权威实现导出同一份 apply/inject');
 
   // fail-closed 复检（独立于 test-audit-setup-guards.mjs 的那份假 ctx 测试）。

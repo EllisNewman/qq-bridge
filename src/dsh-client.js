@@ -637,6 +637,11 @@ export class NodeApiClient extends AbstractApiClient {
     return response.json();
   }
 
+  /** DSH 0.2.0 的会话分页 RPC（session/page）；基类的 history 在新版可能不可用。 */
+  pageSession(payload, signal) {
+    return this.callUnary('session/page', payload, signal);
+  }
+
   /** 新版 DSH 的 agentPresets 命名空间是复数；旧版基类仍映射到 agentPreset.list。 */
   agentPresets = {
     list: (payload, signal) => this.callUnary('agentPresets.list', payload, signal),

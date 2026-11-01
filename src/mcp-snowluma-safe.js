@@ -329,6 +329,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_forget: 'memory',
   qq_memory_pin: 'memory',
   qq_memory_stats: 'memory',
+  qq_thought_use: 'memory',
+  qq_thought_drop: 'memory',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -888,7 +890,12 @@ server.tool(
       participants: z.array(z.string()).optional().describe('activeTopic 的参与者列表'),
       pendingQuestion: z.string().optional().describe('activeTopic 里还没问出口的问题'),
       motivation: z.string().optional().describe('pendingThought 的动机，如 curiosity/sociability'),
-      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时')
+      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时'),
+      notBeforeMs: z.number().optional().describe('pendingThought 最早可说的相对毫秒数（如明天再问）'),
+      ttlMs: z.number().optional().describe('pendingThought 存活毫秒数'),
+      kind: z.enum(['followup', 'reminder', 'thought', 'question', 'share']).optional().describe('pendingThought 类型'),
+      priority: z.number().optional().describe('pendingThought 优先级 1-5'),
+      sourceSeq: z.number().optional().describe('来源消息 seq')
     }).optional().describe('附加信息')
   },
   async ({ key, token, category, content, extra }) => {
@@ -1056,6 +1063,50 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `读取长期记忆统计失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_thought_use',
+  '把一条「想说还没说」的想法标记为已说（说出去后桥接通常会自动识别；这里用于明确确认）。id 来自 qq_memory_query / 提示词里的 [t_xxx]。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('想法 id（t_ 开头）')
+  },
+  async ({ key, token, id }) => {
+    try {
+      const data = await agentApi('/api/socialV2/thought/use', {
+        method: 'POST',
+        body: JSON.stringify({ key, id }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `标记想法失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_thought_drop',
+  '丢弃一条「想说还没说」的想法：现在不想说、或想法已过时。id 来自 qq_memory_query / 提示词里的 [t_xxx]。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('想法 id（t_ 开头）')
+  },
+  async ({ key, token, id }) => {
+    try {
+      const data = await agentApi('/api/socialV2/thought/drop', {
+        method: 'POST',
+        body: JSON.stringify({ key, id }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `丢弃想法失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

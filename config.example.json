@@ -34,13 +34,26 @@
       "recallMaxChars": 300,
       "maxRecallFacts": 3,
       "maxPinnedFacts": 2,
-      "cooldownMs": 1800000
+      "cooldownMs": 1800000,
+      "lightweightImpressions": true
     },
     "facts": {
-      "maxActive": 300
+      "maxActive": 300,
+      "maxTextChars": 120,
+      "minConfidence": 0.6
     },
     "episodes": {
       "maxActive": 400
+    },
+    "distill": {
+      "enabled": true,
+      "preset": "qq-memory",
+      "everyMessages": 30,
+      "idleMs": 7200000,
+      "dailyAt": "04:00",
+      "maxMessagesPerRun": 60,
+      "maxTurnsPerSession": 20,
+      "timeoutMs": 120000
     }
   },
   "snowluma": {
@@ -263,10 +276,29 @@
     },
     "proactive": {
       "enabled": true,
+      "privateOnly": true,
       "checkIntervalMinMs": 1800000,
       "checkIntervalMaxMs": 5400000,
       "idleThresholdMs": 900000,
-      "probability": 0.3
+      "probability": 0.3,
+      "thoughtBoost": 1.4,
+      "maxPerDay": 6,
+      "maxMessagesPerInitiation": 0,
+      "minGapMs": 5400000,
+      "cooldownAfterAnyWakeMs": 1800000,
+      "quietHours": {
+        "start": 23,
+        "end": 8,
+        "hardBlock": true
+      },
+      "maxUnanswered": 3,
+      "noProactiveIfUnread": true
+    },
+    "thought": {
+      "defaultTtlMs": 259200000,
+      "maxPending": 20,
+      "maxAttempts": 3,
+      "maxHistory": 50
     },
     "feedback": {
       "maxLength": 500,

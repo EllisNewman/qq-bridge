@@ -1,3 +1,6 @@
+import * as proactive from '../src/proactive.js';
+import * as memoryDistiller from '../src/memory-distiller.js';
+import * as memoryReset from '../src/memory-reset.js';
 // Execute the real bridge initialization/functions against temporary files and fake peers.
 // No production config, QQ connection, DSH process, or persistent home is accessed.
 import fs from 'node:fs';
@@ -123,6 +126,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
+    scheduleThoughtDueV2, appendSocialV2Poke, markThoughtUsed, dropThought,
+    surfaceThoughtsForKey, consumeSurfacedThoughts, finishSurfacedThoughts, privateProactiveBlockReason, runThoughtDueV2,
+    enqueueDistill, runDailyDistill, distillScopeNow, archiveStore, memoryStore,
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
@@ -166,7 +172,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...conversationContext, ...stateIO, ...time, ...archive, ...memory, ...roleCard, archiveScopeForKey: archive.scopeForKey,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...conversationContext, ...stateIO, ...time, ...archive, ...memory, ...memoryReset, ...memoryDistiller, ...proactive, ...roleCard, archiveScopeForKey: archive.scopeForKey,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

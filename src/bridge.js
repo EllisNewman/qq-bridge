@@ -22,9 +22,12 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { createConversationContext, contextPreview, recentExchangeGroups, orderContextMessages } from './conversation-context.js';
-import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour } from './time.js';
+import { configureTime, nowMs, formatClock, formatDateTime, formatWithZone, parseTime, isQuietHour, dayKey, startOfDayMs, formatDate } from './time.js';
 import { createArchiveStore, buildBackfillEntries, scopeForKey as archiveScopeForKey } from './archive-log.js';
 import { createMemoryStore } from './memory-store.js';
+import { buildDistillPrompt, parseDistillOutput, applyDistillOutput, buildHandoffPrompt, parseHandoffOutput, fallbackHandoff, renderDailyDigest, selectDistillWindow } from './memory-distiller.js';
+import { thoughtOverlap, pickSurfacedThoughts, nextQuietEndMs, evaluatePrivateProactive, privateProactiveProbability } from './proactive.js';
+import { createBackup, listBackups, removeScopeFiles, isQqSessionCandidate, listMemoryScopes, listArchiveScopes } from './memory-reset.js';
 import { readJsonSafe, atomicWriteJson, atomicWriteText } from './state-io.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
@@ -66,6 +69,8 @@ const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
 const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
 const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
+const MEMORY_SESSION_FILE = path.join(STATE_DIR, 'memory-session.json');
+const MEMORY_AGENT_DIR = path.join(STATE_DIR, 'memory-agent');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 操作者为每个会话预写的「初始提示词」（见 main() 里的 initialPrompts）。
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
@@ -614,6 +619,7 @@ function loadConfig() {
       const inject = (raw.inject && typeof raw.inject === 'object' && !Array.isArray(raw.inject)) ? raw.inject : {};
       const facts = (raw.facts && typeof raw.facts === 'object' && !Array.isArray(raw.facts)) ? raw.facts : {};
       const episodes = (raw.episodes && typeof raw.episodes === 'object' && !Array.isArray(raw.episodes)) ? raw.episodes : {};
+      const distill = (raw.distill && typeof raw.distill === 'object' && !Array.isArray(raw.distill)) ? raw.distill : {};
       return {
         enabled: raw.enabled !== false,
         rawArchive: { enabled: archive.enabled !== false, retentionDays: 0, warnBytes: 104857600, ...archive },
@@ -625,10 +631,22 @@ function loadConfig() {
           maxRecallFacts: 3,
           maxPinnedFacts: 2,
           cooldownMs: 1800000,
+          lightweightImpressions: true,
           ...inject
         },
         facts: { maxActive: 300, ...facts },
-        episodes: { maxActive: 400, ...episodes }
+        episodes: { maxActive: 400, ...episodes },
+        distill: {
+          enabled: true,
+          preset: 'qq-memory',
+          everyMessages: 30,
+          idleMs: 7200000,
+          dailyAt: '04:00',
+          maxMessagesPerRun: 60,
+          maxTurnsPerSession: 20,
+          timeoutMs: 120000,
+          ...distill
+        }
       };
     })(),
     dsh: {
@@ -1055,6 +1073,7 @@ function consolePortInUse() {
 }
 
 function acquireLock() {
+  if (fs.existsSync(path.join(STATE_DIR, 'memory-restore.lock'))) throw new Error('记忆恢复进行中或残留恢复锁，请先检查恢复结果');
   fs.mkdirSync(STATE_DIR, { recursive: true });
   // 原子创建锁文件：把 PID 一次性写入（flag 'wx'），避免“先建空文件再写 PID”的窗口被第二个进程当作过期锁偷走。
   const tryCreate = () => {
@@ -1402,6 +1421,17 @@ async function main() {
   const learnerCollectors = new Map();  // sessionId -> turn collector
   const learnerWaiters = new Map();     // sessionId -> [{resolve,reject,timer}]
   let slangLearnerSessionId = null;
+  // M4：记忆蒸馏会话（zero-tool qq-memory preset），与黑话学习共用 learner turn 收集机制。
+  let memoryDistillerSessionId = null;
+  let memoryDistillerTurns = 0;
+  // M5：本回合被主动呈现的想法（key -> {ids, reason, at}），供发送/回合结束消费。
+  const surfacedThoughts = new Map();
+  const distillTimers = new Map();
+  const distillIdleTimers = new Map();
+  const distillRunning = new Set();
+  let distillDailyTimer = null;
+  let distillSchedulerStarted = false;
+  let distillChain = Promise.resolve();
   let slangTaskChain = Promise.resolve();
 
   // ── 表情包体系（二代仿真）本地知识库 ────────────────────────────────────
@@ -2726,7 +2756,7 @@ async function main() {
     markReadCalledKeys.delete(key);
   }
 
-  function retireSession(key) {
+  function retireSession(key, opts = {}) {
     const sessionId = state.sessions[key];
     delete state.sessions[key];
     delete state.sessionPolicies[key];
@@ -2767,6 +2797,76 @@ async function main() {
     saveSocialV2State();
     stopRetiredSessionWork(sessionId, key);
     log(`会话权限已变化，停用旧映射 ${key} -> ${sessionId}`);
+    if (opts.handoff !== false) {
+      void runHandoff(key, sessionId, { reason: opts.reason || 'retire' })
+        .catch((error) => log(`[memory] handoff 失败 ${key}：${error?.message ?? error}`));
+    }
+  }
+
+  /**
+   * M3：完整清掉一个 key 的桥接侧运行态（映射/定时器/队列/轻量记忆/token），
+   * 并按需停止 + 归档 DSH 会话。与 /api/session/reset 的区别：这里是可 await 的，
+   * 且会返回归档结果与错误，供 performMemoryReset 汇总。
+   */
+  async function clearConversationSession(key, { stopWork = true } = {}) {
+    const oldSessionId = state.sessions[key] ?? null;
+    const errors = [];
+    if (oldSessionId && stopWork) {
+      // Memory reset discards handoff; ordinary session reset retains it separately.
+      await withTimeout(api.stopSessionWork(oldSessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork');
+      await withTimeout(api.workspace.archiveSession({ sessionId: oldSessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession');
+      if (state.sessions[key] !== oldSessionId) throw new Error('会话已变化，请重新执行重置');
+    }
+    sessionEpoch += 1;
+    delete state.sessions[key];
+    delete state.sessionPolicies[key];
+    forgetConversationCaches(key);
+    surfacedThoughts.delete(key);
+    disarmPendingWakeLease(key);
+    if (oldSessionId) {
+      sessionModels.delete(oldSessionId);
+      modelAppliedSessions.delete(oldSessionId);
+      reverse.delete(oldSessionId);
+      collectors.delete(oldSessionId);
+      sendToolSucceededSessions.delete(oldSessionId);
+      pendingSendToolCalls.delete(oldSessionId);
+      v2TurnStartAt.delete(oldSessionId);
+      turnLeaseNoted.delete(oldSessionId);
+      toolCallNames.delete(oldSessionId);
+      social.silentTurns.delete(oldSessionId);
+      social.exitingSessions.delete(oldSessionId);
+      api.events.forget?.(oldSessionId);
+    }
+    const pe = pending.get(key);
+    if (pe) {
+      clearTimeout(pe.timer);
+      cancelPendingEntry(pe).catch(() => {});
+    }
+    pending.delete(key);
+    queued.delete(key);
+    queuedHintAt.delete(key);
+    sessionPromises.delete(key);
+    drainPromptQueue(key, '会话已重置');
+    social.recentMessages.delete(key);
+    messageMediaStore.delete(key);
+    social.pendingSummaries.delete(key);
+    social.states.delete(key);
+    social.silentContext.delete(key);
+    slangWindows.delete(key);
+    slangExtractionCooldowns.delete(key);
+    slangSubmitTimes.delete(key);
+    cancelSocialTimers(key);
+    clearSocialV2Timers(key);
+    pendingWakeKeys.delete(key);
+    wakeConfigUpdatedKeys.delete(key);
+    markReadCalledKeys.delete(key);
+    wakeConfigMissCount.delete(key);
+    forgetAgentToken(key);
+    socialV2.conversations.delete(key);
+    seenForwardIds.delete(key);
+    saveSocialV2State();
+    saveState();
+    return { key, archived: oldSessionId, errors };
   }
 
   function reconcileSessionPolicies() {
@@ -2781,7 +2881,7 @@ async function main() {
     // 一次网络抖动换来全体失忆，代价完全不成比例。清单为空时宁可不判定，等下一轮。
     if (dshPresetIds.length === 0) return;
     for (const [key, sessionId] of Object.entries(state.sessions)) {
-      if (!isCurrentSession(key, sessionId)) retireSession(key);
+      if (!isCurrentSession(key, sessionId)) retireSession(key, { reason: 'policy' });
     }
   }
 
@@ -2871,6 +2971,7 @@ async function main() {
         dshReady = true;
         lastMode = currentMode;
         log(`DSH 已就绪（模式: ${currentMode}）`);
+        startDistillScheduler();
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -4555,7 +4656,7 @@ async function main() {
           sessionPromises.clear();
           clearAllSocialV2Timers();
           drainAllPromptQueues('二代状态已重置');
-          for (const key of [...socialV2.conversations.keys()]) {
+          for (const key of new Set([...socialV2.conversations.keys(), ...listArchiveScopes(STATE_DIR)])) {
             const sid = state.sessions[key];
             if (sid) {
               delete state.sessions[key];
@@ -4685,7 +4786,12 @@ async function main() {
             recentCount: st.recentMessages.length,
             currentWakeConfig: st.wakeConfig,
             wakeSafety: computeWakeSafetyV2(st.wakeConfig),
-            memory: formatMemoryV2(st),
+            memory: formatMemoryV2(st, {
+              includeImpressions: key.startsWith('private:')
+                ? cfg.memory?.inject?.lightweightImpressions !== false
+                : true,
+              thoughtIds: key.startsWith('private:')
+            }),
             longTermMemory: (() => {
               const scope = memoryScopeForKey(key);
               if (!scope) return '';
@@ -6584,7 +6690,7 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
           const st = getSocialV2State(key);
-          appendMemoryV2(st, category, content, extra);
+          appendMemoryV2(st, category, content, extra, key);
           sendJson({ ok: true, key, category, content, memory: formatMemoryV2(st) });
           return;
         }
@@ -6678,7 +6784,7 @@ async function main() {
             raw.activeTopics = [];
             raw.pendingThoughts = [];
           }
-          sendJson({ ok: true, key, category, formatted: formatMemoryV2({ ...st, ...raw }), raw });
+          sendJson({ ok: true, key, category, formatted: formatMemoryV2({ ...st, ...raw }, { thoughtIds: key.startsWith('private:') }), raw });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-remove') {
@@ -6756,6 +6862,155 @@ async function main() {
           return;
         }
 
+        // ── M6 记忆总览 / 指标 / 备份（控制台） ──────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/memory/scopes') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const keys = new Set([
+            ...Object.keys(state.sessions || {}),
+            ...socialV2.conversations.keys(),
+            ...listMemoryScopes(STATE_DIR),
+            ...listArchiveScopes(STATE_DIR)
+          ]);
+          const scopes = [...keys].filter((k) => /^private:[1-9]\d*$/.test(k)).map((key) => {
+            const info = archiveScopeForKey(key);
+            const a = info ? archiveStore.stats(info.scope) : null;
+            const m = info ? memoryStore.stats(info.scope) : null;
+            const st = socialV2.conversations.get(key);
+            const thoughts = Array.isArray(st?.pendingThoughts)
+              ? st.pendingThoughts.filter((x) => x && x.status === 'pending' && (!x.expiresAt || Date.now() < Number(x.expiresAt))).length
+              : 0;
+            return {
+              key,
+              conv: a?.conv || m?.conv || '',
+              archive: a ? { lastSeq: a.lastSeq, totalLines: a.totalLines, totalBytes: a.totalBytes, days: a.days, oldestDay: a.oldestDay, newestDay: a.newestDay } : null,
+              memory: m ? { active: m.active, pinned: m.pinned, archived: m.archived, episodes: m.episodes, readOnly: m.readOnly, summarizedThroughSeq: m.summarizedThroughSeq } : null,
+              social: st ? {
+                unread: Array.isArray(st.unread) ? st.unread.length : 0,
+                pendingThoughts: thoughts,
+                lastIncomingAt: Number(st.lastIncomingAt) || 0,
+                lastProactiveAt: Number(st.lastProactiveAt) || 0,
+                proactiveDayKey: String(st.proactiveDayKey || ''),
+                proactiveCount: Number(st.proactiveCount) || 0
+              } : null,
+              lastAt: Math.max(Number(st?.lastIncomingAt) || 0, Number(m?.updatedAt) || 0)
+            };
+          }).sort((x, y) => y.lastAt - x.lastAt);
+          const totals = {
+            scopes: scopes.length,
+            facts: scopes.reduce((n, s) => n + (s.memory?.active || 0), 0),
+            archivedFacts: scopes.reduce((n, s) => n + (s.memory?.archived || 0), 0),
+            episodes: scopes.reduce((n, s) => n + (s.memory?.episodes || 0), 0),
+            archiveLines: scopes.reduce((n, s) => n + (s.archive?.totalLines || 0), 0),
+            archiveBytes: scopes.reduce((n, s) => n + (s.archive?.totalBytes || 0), 0),
+            unread: scopes.reduce((n, s) => n + (s.social?.unread || 0), 0),
+            thoughts: scopes.reduce((n, s) => n + (s.social?.pendingThoughts || 0), 0)
+          };
+          sendJson({ ok: true, scopes, totals });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/metrics') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const scopes = new Set([...listMemoryScopes(STATE_DIR), ...listArchiveScopes(STATE_DIR), ...Object.keys(state.sessions || {}), ...socialV2.conversations.keys()]);
+          let archiveLines = 0;
+          let archiveBytes = 0;
+          let facts = 0;
+          let archivedFacts = 0;
+          let episodes = 0;
+          let unread = 0;
+          let thoughts = 0;
+          const today = dayKey(nowMs());
+          let proactiveToday = 0;
+          for (const key of scopes) {
+            if (!key.startsWith('private:')) continue;
+            const info = archiveScopeForKey(key);
+            if (!info) continue;
+            const a = archiveStore.stats(info.scope);
+            const m = memoryStore.stats(info.scope);
+            archiveLines += a.totalLines;
+            archiveBytes += a.totalBytes;
+            facts += m.active;
+            archivedFacts += m.archived;
+            episodes += m.episodes;
+            const st = socialV2.conversations.get(key);
+            if (st) {
+              unread += Array.isArray(st.unread) ? st.unread.length : 0;
+              thoughts += Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((x) => x && x.status === 'pending' && (!x.expiresAt || Date.now() < Number(x.expiresAt))).length : 0;
+              if (st.proactiveDayKey === today) proactiveToday += Number(st.proactiveCount) || 0;
+            }
+          }
+          sendJson({
+            ok: true,
+            time: formatWithZone(nowMs()),
+            conversations: socialV2.conversations.size,
+            scopes: [...scopes].filter((k) => k.startsWith('private:')).length,
+            archive: { lines: archiveLines, bytes: archiveBytes },
+            memory: { facts, archivedFacts, episodes },
+            social: { unread, thoughts, proactiveToday },
+            backups: listBackups(path.join(STATE_DIR, 'backups')).length,
+            distill: distillConfig().enabled
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/memory/backup') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const body = await readBody();
+          try {
+            const result = await enqueueDistill(() => {
+              saveState(); saveSocialV2State(); archiveStore.flushAll();
+              return createBackup({ stateDir: STATE_DIR, includeArchive: body.includeArchive === true, label: 'console' });
+            });
+            sendJson({ ok: true, dir: result.dir, manifest: result.manifest, pruned: result.pruned, backups: listBackups(path.join(STATE_DIR, 'backups')).length });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        // ── M3 记忆重置 / 备份列表（管理端；恢复必须停机走 CLI） ──────────────
+        if (req.method === 'POST' && url.pathname === '/api/memory/reset') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const body = await readBody();
+          try {
+            const result = await enqueueDistill(() => performMemoryReset({
+              scope: String(body.scope ?? 'private'),
+              key: String(body.key ?? ''),
+              includeLongTerm: body.includeLongTerm !== false,
+              includeArchive: body.includeArchive === true,
+              allowGroup: body.allowGroup === true,
+              dryRun: body.dryRun === true
+            }));
+            sendJson({ ok: result.errors.length === 0, ...result }, result.errors.length ? 503 : 200);
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, Number(error?.statusCode) || 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/memory/backups') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          sendJson({ ok: true, backups: listBackups(path.join(STATE_DIR, 'backups')) });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/memory/restore') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          sendJson({ ok: false, error: '恢复备份需要先停止 bridge：docker compose stop qq-bridge，然后运行 node scripts/memory-reset.mjs --restore <dir>' }, 409);
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/memory/distill') {
+          if (!memoryEnabled()) { sendJson({ ok: false, error: '长期记忆已关闭' }, 403); return; }
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!/^private:[1-9]\d*$/.test(key)) { sendJson({ ok: false, error: 'key 必须是 private:<QQ>' }, 400); return; }
+          try {
+            const result = await enqueueDistill(() => distillScopeNow(key, { reason: 'manual', force: true }));
+            sendJson({ ...result }, result?.ok ? 200 : 503);
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
         // ── M2 长期记忆：控制台/CLI 管理（带 agent token 的请求一律拒绝） ──
         if (url.pathname.startsWith('/api/memory/')) {
           if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
@@ -6771,7 +7026,8 @@ async function main() {
               key,
               stats: memoryStore.stats(scope),
               formatted: memoryStore.formatForGetPrompt(scope, 4000),
-              facts: memoryStore.listFacts(scope, { status: 'all', limit: 200 })
+              facts: memoryStore.listFacts(scope, { status: 'all', limit: 500 }),
+              episodes: memoryStore.listEpisodes(scope, { limit: 100 })
             });
             return;
           }
@@ -6814,6 +7070,24 @@ async function main() {
             return;
           }
           sendJson({ ok: false, error: 'not found' }, 404);
+          return;
+        }
+
+        // ── M5 想法消费：AI 主动标记已说 / 丢弃 ────────────────────────────
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/thought/use' || url.pathname === '/api/socialV2/thought/drop')) {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const id = String(body.id ?? '').trim();
+          if (!key || !id) { sendJson({ ok: false, error: 'key/id 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_thought_*' }, 403); return; }
+          const st = getSocialV2State(key);
+          const thought = findThought(st, id);
+          if (!thought) { sendJson({ ok: false, error: '想法不存在或已处理' }, 404); return; }
+          const use = url.pathname.endsWith('/use');
+          const ok = use ? markThoughtUsed(key, id) : dropThought(key, id);
+          sendJson({ ok, key, id, thought: { id: thought.id, text: thought.text, status: use ? 'used' : 'dropped' } });
           return;
         }
 
@@ -7130,7 +7404,9 @@ async function main() {
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
-          // 归档只隐藏会话，不终止 DSH 侧排队的工作；先清队列并取消当前回合。
+          // 归档只隐藏会话，不终止 DSH 侧排队的工作；先写交接摘要，再清队列并取消当前回合。
+          try { await runHandoff(key, oldSessionId, { reason: 'session-reset' }); }
+          catch (error) { log(`[memory] handoff 失败 ${key}：${error?.message ?? error}`); }
           try { await withTimeout(api.stopSessionWork(oldSessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); }
           catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
           try { await withTimeout(api.workspace.archiveSession({ sessionId: oldSessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
@@ -7139,30 +7415,48 @@ async function main() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
+          const body = await readBody();
+          const dryRun = body.dryRun === true;
+          const errors = [];
+          const candidates = [];
+          let list;
+          try {
+            list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
+          } catch (error) {
+            // DSH 不可用时直接清桥接状态会留下「映射没了、会话还在跑」的黑洞；宁可失败。
+            sendJson({ ok: false, error: `无法列出 DSH 会话，已取消清空：${error?.message ?? error}` }, 503);
+            return;
+          }
+          const seen = new Set();
+          for (const item of list.items ?? []) {
+            if (isQqSessionCandidate(item, { sessionCwd: cfg.sessionCwd, stateDir: STATE_DIR })) {
+              candidates.push({ sessionId: item.sessionId, cwd: item.cwd ?? null, agentPreset: item.agentPreset ?? null });
+              seen.add(item.sessionId);
+            }
+          }
+          // 映射里有、但 session/list 没返回的（例如刚归档/刚创建）也要停掉，避免漏网。
+          for (const [key, sessionId] of Object.entries(state.sessions || {})) {
+            if (!sessionId || seen.has(sessionId)) continue;
+            candidates.push({ sessionId, cwd: null, agentPreset: null, key });
+            seen.add(sessionId);
+          }
+          if (dryRun) {
+            sendJson({ ok: true, dryRun: true, candidates, count: candidates.length, errors });
+            return;
+          }
           sessionEpoch++;
           let archivedCount = 0;
           let stoppedCount = 0;
-          try {
-            // 新版 DSH 不再提供 workspace.list；改为扫描本桥接创建的会话目录并归档。
-            // 只处理 cwd 位于 qq-bridge state/ 下的根会话；子代理会话由父会话管理，不能误归档。
-            const list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
-            const stateDir = path.resolve(STATE_DIR);
-            const statePrefix = path.normalize(stateDir + path.sep);
-            const normPath = (p) => path.normalize(String(p ?? '').replace(/\//g, path.sep));
-            const isUnderState = (cwd) => process.platform === 'win32'
-              ? cwd.toLowerCase().startsWith(statePrefix.toLowerCase())
-              : cwd.startsWith(statePrefix);
-            for (const item of list.items ?? []) {
-              if (item.origin === 'subagent' || item.parentSessionId) continue;
-              const cwd = normPath(item.cwd);
-              if (isUnderState(cwd)) {
-                // 归档只隐藏会话；必须先把 DSH 侧排队的工作清掉并取消当前回合。
-                try { await withTimeout(api.stopSessionWork(item.sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); stoppedCount += 1; }
-                catch (error) { log(`⚠️ 停止旧会话失败 ${item.sessionId}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-                try { await withTimeout(api.workspace.archiveSession({ sessionId: item.sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); archivedCount += 1; } catch {}
-              }
-            }
-          } catch {}
+          for (const item of candidates) {
+            try { await withTimeout(api.stopSessionWork(item.sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); stoppedCount += 1; }
+            catch (error) { errors.push(`停止 ${item.sessionId} 失败：${error?.message ?? error}`); }
+            try { await withTimeout(api.workspace.archiveSession({ sessionId: item.sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); archivedCount += 1; }
+            catch (error) { errors.push(`归档 ${item.sessionId} 失败：${error?.message ?? error}`); }
+          }
+          if (errors.length) {
+            sendJson({ ok: false, error: '停止或归档失败，已保留桥接状态', candidates, archivedCount, stoppedCount, errors }, 503);
+            return;
+          }
           for (const entry of pending.values()) {
             clearTimeout(entry.timer);
             cancelPendingEntry(entry).catch(() => {});
@@ -7186,6 +7480,7 @@ async function main() {
           cancelAllSocialTimers();
           clearAllSocialV2Timers();
           // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
+          surfacedThoughts.clear();
           socialV2.conversations.clear();
           CONVERSATION_TOKENS.clear();
           KNOWN_AGENT_TOKENS.clear();
@@ -7200,8 +7495,8 @@ async function main() {
           toolCallNames.clear();
           saveState();
           try { fs.writeFileSync(ACTIVITY_LOG, ''); } catch {}
-          log(`控制台：已清空 QQ 聊天工作区（停止 ${stoppedCount} 个、归档 ${archivedCount} 个会话，映射与活动日志已清空）`);
-          sendJson({ ok: true, archivedCount, stoppedCount });
+          log(`控制台：已清空 QQ 聊天工作区（候选 ${candidates.length}，停止 ${stoppedCount}，归档 ${archivedCount}${errors.length ? `，错误 ${errors.length}` : ''}；映射与活动日志已清空）`);
+          sendJson({ ok: true, dryRun: false, candidates: candidates.length, archivedCount, stoppedCount, errors });
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
@@ -8102,14 +8397,14 @@ async function main() {
     if (existing) {
       // reset/清空工作区期间旧映射可能尚未清理；发现代际不匹配必须丢弃旧会话，防止复活。
       if (!isCurrentSession(key, existing)) {
-        retireSession(key);
+        retireSession(key, { handoff: false, reason: 'stale-mapping' });
       } else {
         const applied = await ensureChatModel(existing);
         // DSH 侧会话已不存在（DSH 重启、异常退出、归档竞态）：本地映射已经失效，
         // 必须退役并重建，否则每条消息都会对着一个不存在的会话重试 selectModel。
         if (applied === 'not-found') {
           log(`会话 ${key} 在 DSH 侧已不存在，退役本地映射并在本次调用中重建`);
-          retireSession(key);
+          retireSession(key, { handoff: false, reason: 'not-found' });
         } else {
           if (epoch !== sessionEpoch || !isCurrentSession(key, existing)) throw new Error('会话创建期间已重置或权限已变化');
           return existing;
@@ -8174,7 +8469,7 @@ async function main() {
       saveState();
       await ensureChatModel(sessionId);
       if (epoch !== sessionEpoch || !isCurrentSession(key, sessionId)) {
-        if (state.sessions[key] === sessionId) retireSession(key);
+        if (state.sessions[key] === sessionId) retireSession(key, { handoff: false, reason: 'epoch-race' });
         throw new Error('会话创建期间已重置或权限已变化');
       }
       log(`新会话 ${key} -> ${sessionId}（模式 ${currentMode}，preset: ${modePreset(key, currentMode, cfg) ?? '默认'}）`);
@@ -8397,6 +8692,88 @@ async function main() {
     }
   }
 
+  function thoughtConfig() {
+    const th = cfg.socialV2?.thought ?? {};
+    return {
+      defaultTtlMs: Math.max(60000, Number(th.defaultTtlMs) || 3 * 24 * 60 * 60 * 1000),
+      maxPending: Math.max(1, Math.min(100, Number(th.maxPending) || 20)),
+      maxAttempts: Math.max(1, Math.min(10, Number(th.maxAttempts) || 3)),
+      maxHistory: Math.max(10, Math.min(500, Number(th.maxHistory) || 50))
+    };
+  }
+
+  function normalizeThoughtV2(raw, { privateScope = false } = {}) {
+    const t = raw && typeof raw === 'object' ? raw : {};
+    const now = Date.now();
+    const tc = thoughtConfig();
+    const defaultTtl = privateScope ? tc.defaultTtlMs : 2 * 60 * 60 * 1000;
+    const text = String(t.text ?? '').trim().slice(0, 200);
+    const id = typeof t.id === 'string' && /^t_[A-Za-z0-9_-]{4,}$/.test(t.id)
+      ? t.id
+      : `t_${crypto.randomBytes(6).toString('hex')}`;
+    const status = ['pending', 'used', 'dropped'].includes(t.status) ? t.status : 'pending';
+    return {
+      id,
+      text,
+      kind: ['followup', 'reminder', 'thought', 'question', 'share'].includes(t.kind) ? t.kind : 'thought',
+      motivation: String(t.motivation || 'curiosity').slice(0, 50),
+      priority: Math.min(5, Math.max(1, Number(t.priority) || 2)),
+      notBefore: Number(t.notBefore ?? t.notBeforeMs) || 0,
+      expiresAt: Number(t.expiresAt) || (now + defaultTtl),
+      status,
+      reason: typeof t.reason === 'string' ? t.reason.slice(0,80) : '',
+      attempts: Math.max(0, Number(t.attempts) || 0),
+      createdAt: Number(t.createdAt) || now,
+      usedAt: Number(t.usedAt) || null,
+      usedMessageId: t.usedMessageId != null ? String(t.usedMessageId).slice(0, 64) : null,
+      sourceSeq: Number(t.sourceSeq) || 0
+    };
+  }
+
+  function pushThoughtHistory(st, thought) {
+    if (!Array.isArray(st.thoughtHistory)) st.thoughtHistory = [];
+    st.thoughtHistory.push({ ...thought });
+    const max = thoughtConfig().maxHistory;
+    if (st.thoughtHistory.length > max) st.thoughtHistory.splice(0, st.thoughtHistory.length - max);
+  }
+
+  function findThought(st, id) {
+    if (!st || !id) return null;
+    return (Array.isArray(st.pendingThoughts) ? st.pendingThoughts : []).find((x) => x && x.id === id && x.status === 'pending' && (!x.expiresAt || Date.now() < Number(x.expiresAt))) || null;
+  }
+
+  function removePendingThought(st, id) {
+    if (!Array.isArray(st.pendingThoughts)) return null;
+    const idx = st.pendingThoughts.findIndex((x) => x && x.id === id);
+    if (idx < 0) return null;
+    return st.pendingThoughts.splice(idx, 1)[0];
+  }
+
+  function markThoughtUsed(key, id) {
+    const st = getSocialV2State(key);
+    const thought = findThought(st, id);
+    if (!thought) return false;
+    removePendingThought(st, id);
+    thought.status = 'used';
+    thought.usedAt = Date.now();
+    pushThoughtHistory(st, thought);
+    saveSocialV2State();
+    scheduleThoughtDueV2(key);
+    return true;
+  }
+
+  function dropThought(key, id) {
+    const st = getSocialV2State(key);
+    const thought = findThought(st, id);
+    if (!thought) return false;
+    removePendingThought(st, id);
+    thought.status = 'dropped';
+    pushThoughtHistory(st, thought);
+    saveSocialV2State();
+    scheduleThoughtDueV2(key);
+    return true;
+  }
+
   function getSocialV2State(key) {
     // 只允许内部约定的会话 key 格式，并统一成无前导零的正整数形式，防止同一会话分裂成多个状态。
     const canonical = canonicalV2Key(key);
@@ -8424,6 +8801,7 @@ async function main() {
         sleepTimer: null,
         replyCheckTimer: null,
         proactiveTimer: null,
+        thoughtTimer: null,
         rateLimitRetryTimer: null,
         lastIncomingAt: 0,
         preSleepWaitSatisfiedAt: 0,
@@ -8434,11 +8812,18 @@ async function main() {
         modelSeenSeqs: new Set(),
         activeTopics: [],
         pendingThoughts: [],
+        thoughtHistory: [],
+        lastProactiveAt: 0,
+        proactiveDayKey: '',
+        proactiveCount: 0,
+        lastAnyWakeAt: 0,
+        unansweredCount: 0,
         memberImpressions: {}
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
       scheduleProactiveCheckV2(key);
+      scheduleThoughtDueV2(key);
       setupSleepTimerV2(key);
     }
     return st;
@@ -8493,6 +8878,7 @@ async function main() {
             sleepTimer: null,
             replyCheckTimer: null,
             proactiveTimer: null,
+            thoughtTimer: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
@@ -8502,7 +8888,17 @@ async function main() {
               ? Math.min(val.lastReadThroughSeq, Number(val.lastUnreadSeq) || 0) : 0,
             modelSeenSeqs: new Set(),
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
-            pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
+            pendingThoughts: (Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [])
+              .map((x) => normalizeThoughtV2(x, { privateScope: key.startsWith('private:') }))
+              .filter((x) => x.text && x.status === 'pending'),
+            thoughtHistory: (Array.isArray(val.thoughtHistory) ? val.thoughtHistory : [])
+              .map((x) => normalizeThoughtV2(x, { privateScope: key.startsWith('private:') })).slice(-50),
+            lastProactiveAt: Number(val.lastProactiveAt) || 0,
+            proactiveDayKey: String(val.proactiveDayKey || ''),
+            proactiveCount: Math.max(0, Number(val.proactiveCount) || 0),
+            lastAnyWakeAt: Number(val.lastAnyWakeAt) || 0,
+            unansweredCount: Math.max(0, Number(val.unansweredCount) || 0),
+            unansweredWakeAt: Number(val.unansweredWakeAt) || 0,
             memberImpressions: (() => {
               const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
               const clean = {};
@@ -8543,6 +8939,7 @@ async function main() {
           }
           ensureWakeableV2(st, { skipSave: true, key });
           scheduleProactiveCheckV2(key);
+          scheduleThoughtDueV2(key);
         }
         // 加载阶段统一落盘一次，避免 ensureWakeableV2 中途写盘覆盖未加载会话。
         // 但只有在文件仍是「我们读到的那一份」时才写：否则说明有另一个进程写过它，
@@ -8590,6 +8987,13 @@ async function main() {
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
+          thoughtHistory: Array.isArray(st.thoughtHistory) ? st.thoughtHistory.slice(-50) : [],
+          lastProactiveAt: Number(st.lastProactiveAt) || 0,
+          proactiveDayKey: String(st.proactiveDayKey || ''),
+          proactiveCount: Math.max(0, Number(st.proactiveCount) || 0),
+          lastAnyWakeAt: Number(st.lastAnyWakeAt) || 0,
+          unansweredCount: Math.max(0, Number(st.unansweredCount) || 0),
+          unansweredWakeAt: Number(st.unansweredWakeAt) || 0,
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
@@ -8793,7 +9197,7 @@ async function main() {
     return defaultMs;
   }
 
-  function formatMemoryV2(st) {
+  function formatMemoryV2(st, { includeImpressions = true, thoughtIds = false } = {}) {
     if (!st) return '';
     const lines = [];
     const topics = Array.isArray(st.activeTopics) ? st.activeTopics.filter((t) => t && t.text) : [];
@@ -8809,11 +9213,11 @@ async function main() {
     if (thoughts.length) {
       lines.push('【你想说但还没说的】');
       for (const t of thoughts.slice(-10)) {
-        lines.push(`- ${t.text}${t.motivation ? `（${t.motivation}）` : ''}`);
+        lines.push(`- ${thoughtIds && t.id ? `[${t.id}] ` : ''}${t.text}${t.motivation ? `（${t.motivation}）` : ''}`);
       }
     }
     const impressions = st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
-    const names = Object.keys(impressions);
+    const names = includeImpressions ? Object.keys(impressions) : [];
     if (names.length) {
       lines.push('【对群友的印象】');
       for (const name of names.slice(-10)) {
@@ -8825,7 +9229,7 @@ async function main() {
     return lines.join('\n');
   }
 
-  function appendMemoryV2(st, category, content, extra = {}) {
+  function appendMemoryV2(st, category, content, extra = {}, key = '') {
     if (!st) return;
     const text = redactKnownTokensOnly(String(content ?? '')).trim();
     const cat = String(category || '').trim();
@@ -8860,17 +9264,30 @@ async function main() {
       const existing = st.pendingThoughts.find((t) => t && String(t.text || '') === text);
       if (existing) {
         existing.createdAt = Date.now();
-        existing.expiresAt = Date.now() + (Number(extra.expiresAtMs) || 2 * 60 * 60 * 1000);
+        existing.expiresAt = Date.now() + (Number(extra.expiresAtMs) || Number(extra.ttlMs)
+          || (key.startsWith('private:') ? thoughtConfig().defaultTtlMs : 2 * 60 * 60 * 1000));
         if (extra.motivation) existing.motivation = redactKnownTokensOnly(String(extra.motivation)).slice(0, 50);
+        if (extra.notBeforeMs !== undefined) existing.notBefore = Date.now() + Math.max(0, Number(extra.notBeforeMs) || 0);
+        if (extra.kind) existing.kind = normalizeThoughtV2({ ...existing, kind: extra.kind }).kind;
+        if (extra.priority !== undefined) existing.priority = Math.min(5, Math.max(1, Number(extra.priority) || 2));
+        if (existing.status === 'used' || existing.status === 'dropped') existing.status = 'pending';
       } else {
-        st.pendingThoughts.push({
+        const now = Date.now();
+        const defaultTtl = key.startsWith('private:') ? thoughtConfig().defaultTtlMs : 2 * 60 * 60 * 1000;
+        st.pendingThoughts.push(normalizeThoughtV2({
           text: text.slice(0, 200),
-          createdAt: Date.now(),
-          expiresAt: Date.now() + (Number(extra.expiresAtMs) || 2 * 60 * 60 * 1000),
-          motivation: redactKnownTokensOnly(String(extra.motivation || 'curiosity')).slice(0, 50)
-        });
+          createdAt: now,
+          expiresAt: now + (Number(extra.expiresAtMs) || Number(extra.ttlMs) || defaultTtl),
+          notBefore: now + Math.max(0, Number(extra.notBeforeMs) || 0),
+          kind: extra.kind,
+          priority: extra.priority,
+          motivation: redactKnownTokensOnly(String(extra.motivation || 'curiosity')).slice(0, 50),
+          sourceSeq: Number(extra.sourceSeq) || 0
+        }, { privateScope: key.startsWith('private:') }));
       }
-      if (st.pendingThoughts.length > 20) st.pendingThoughts.splice(0, st.pendingThoughts.length - 20);
+      const maxPending = thoughtConfig().maxPending;
+      if (st.pendingThoughts.length > maxPending) st.pendingThoughts.splice(0, st.pendingThoughts.length - maxPending);
+      if (key) scheduleThoughtDueV2(key);
     } else if (cat === 'memberImpression') {
       const target = String(extra.target || '').trim();
       if (!target || ['__proto__', 'constructor', 'prototype'].includes(target)) return;
@@ -8906,10 +9323,433 @@ async function main() {
     const info = archiveScopeForKey(key);
     if (!info) return null;
     try {
-      return archiveStore.append(info.scope, entry);
+      const record = archiveStore.append(info.scope, entry);
+      noteArchiveActivity(key);
+      return record;
     } catch (error) {
       log(`[archive] 写入失败 ${key}: ${error?.message ?? error}`);
       return null;
+    }
+  }
+
+  async function performMemoryReset(opts = {}) {
+    const scope = String(opts.scope || 'private');
+    if (!['session', 'private', 'all'].includes(scope)) {
+      throw Object.assign(new Error('scope 必须是 session / private / all'), { statusCode: 400 });
+    }
+    const allowGroup = opts.allowGroup === true;
+    const includeLongTerm = opts.includeLongTerm !== false;
+    const includeArchive = opts.includeArchive === true;
+    const dryRun = opts.dryRun === true;
+    const targets = new Set();
+    const addKey = (k) => {
+      if (!/^(private|group):[1-9]\d*$/.test(k)) return;
+      if (k.startsWith('private:')) { targets.add(k); return; }
+      if (allowGroup && scope === 'all') targets.add(k);
+    };
+    if (scope === 'session') {
+      const key = String(opts.key || '').trim();
+      if (!key) throw Object.assign(new Error('scope=session 需要 key'), { statusCode: 400 });
+      if (!/^(private|group):[1-9]\d*$/.test(key)) {
+        throw Object.assign(new Error('key 必须是 private:<QQ> 或 group:<群号>'), { statusCode: 400 });
+      }
+      if (key.startsWith('group:') && !allowGroup) {
+        throw Object.assign(new Error('群聊记忆重置需要 allowGroup=true'), { statusCode: 400 });
+      }
+      targets.add(key);
+    } else {
+      for (const k of Object.keys(state.sessions || {})) addKey(k);
+      for (const k of socialV2.conversations.keys()) addKey(k);
+      for (const k of listMemoryScopes(STATE_DIR)) addKey(k);
+      for (const k of listArchiveScopes(STATE_DIR)) addKey(k);
+    }
+    const keys = [...targets].sort();
+    if (dryRun) {
+      return { scope, keys, dryRun: true, backupDir: null, archived: [], removed: [], errors: [] };
+    }
+    if (!keys.length) {
+      return { scope, keys, dryRun: false, backupDir: null, archived: [], removed: [], errors: [] };
+    }
+    saveState();
+    saveSocialV2State();
+    archiveStore.flushAll();
+    const backup = createBackup({ stateDir: STATE_DIR, includeArchive, label: `reset:${scope}` });
+    const archived = [];
+    const removed = [];
+    const errors = [];
+    for (const key of keys) {
+      try {
+        const result = await clearConversationSession(key);
+        if (result.archived) archived.push(result.archived);
+        errors.push(...result.errors.map((e) => `${key}: ${e}`));
+        const info = archiveScopeForKey(key);
+        if (info) {
+          archiveStore.rotateConv(info.scope);
+          if (includeLongTerm || includeArchive) {
+            removed.push({ key, ...removeScopeFiles({ stateDir: STATE_DIR, scope: info.scope, includeLongTerm, includeArchive }) });
+          }
+          // 关键：memoryStore 有进程内缓存；删文件/换 conv 后必须让下一次 load 重新读盘，
+          // 否则本次进程还会继续注入已被删除的 facts。
+          if (includeArchive) archiveStore.invalidate(info.scope);
+          memoryStore.invalidate(info.scope);
+        }
+      } catch (error) {
+        errors.push(`${key}: ${error?.message ?? error}`);
+      }
+    }
+    saveState();
+    saveSocialV2State();
+    archiveStore.flushAll();
+    log(`控制台：记忆重置 scope=${scope} keys=${keys.length} backup=${backup.dir}${errors.length ? ` errors=${errors.length}` : ''}`);
+    return { scope, keys, dryRun: false, backupDir: backup.dir, archived, removed, errors };
+  }
+
+  function distillConfig() {
+    const d = cfg.memory?.distill ?? {};
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(d.dailyAt || '04:00'));
+    return {
+      enabled: memoryEnabled() && d.enabled !== false,
+      preset: String(d.preset || 'qq-memory'),
+      everyMessages: Math.max(4, Math.min(500, Number(d.everyMessages) || 30)),
+      idleMs: Math.max(60000, Number(d.idleMs) || 7200000),
+      dailyHour: m ? Math.min(23, Math.max(0, Number(m[1]))) : 4,
+      dailyMinute: m ? Math.min(59, Math.max(0, Number(m[2]))) : 0,
+      maxMessagesPerRun: Math.max(10, Math.min(200, Number(d.maxMessagesPerRun) || 60)),
+      maxTurnsPerSession: Math.max(1, Math.min(200, Number(d.maxTurnsPerSession) || 20)),
+      timeoutMs: Math.max(10000, Math.min(600000, Number(d.timeoutMs) || 120000))
+    };
+  }
+
+  function enqueueDistill(fn) {
+    const p = distillChain.then(fn, fn);
+    distillChain = p.catch(() => {});
+    return p;
+  }
+
+  function scheduleDistill(key, delayMs = 5000) {
+    if (!distillConfig().enabled) return;
+    // 已有排队任务就不要再重置定时器：消息持续到来时 5s 窗口会被无限推迟。
+    if (distillTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      distillTimers.delete(key);
+      void enqueueDistill(() => distillScopeNow(key, { reason: 'auto' }));
+    }, Math.max(1000, Number(delayMs) || 5000));
+    timer.unref?.();
+    distillTimers.set(key, timer);
+  }
+
+  function scheduleIdleDistill(key) {
+    const d = distillConfig();
+    if (!d.enabled) return;
+    const old = distillIdleTimers.get(key);
+    if (old) clearTimeout(old);
+    const timer = setTimeout(() => {
+      distillIdleTimers.delete(key);
+      void enqueueDistill(() => distillScopeNow(key, { reason: 'idle' }));
+    }, d.idleMs);
+    timer.unref?.();
+    distillIdleTimers.set(key, timer);
+  }
+
+  async function ensureMemoryDistillerSession() {
+    const d = distillConfig();
+    const preset = resolvePresetName(d.preset, { strict: true });
+    if (!preset) throw new Error(`记忆蒸馏 preset 不可用：${d.preset}（先运行 setup-dsh 并重启 DSH）`);
+    const saved = readJsonSafe(MEMORY_SESSION_FILE, null);
+    if (saved?.preset !== preset) invalidateMemoryDistillerSession();
+    if (memoryDistillerSessionId) {
+      learnerSessions.add(memoryDistillerSessionId);
+      api.events.follow(memoryDistillerSessionId);
+      return memoryDistillerSessionId;
+    }
+    if (saved?.sessionId && saved.preset === preset) {
+      const savedId = String(saved.sessionId);
+      memoryDistillerSessionId = savedId;
+      learnerSessions.add(savedId);
+      api.events.follow(savedId);
+      try {
+        await ensureChatModel(savedId);
+        return savedId;
+      } catch (error) {
+        log(`记忆蒸馏会话不可复用（${savedId}）：${error?.message ?? error}；重建`);
+        invalidateMemoryDistillerSession();
+      }
+    }
+    fs.mkdirSync(MEMORY_AGENT_DIR, { recursive: true });
+    const wsValue = unwrap(await api.workspace.create({ path: MEMORY_AGENT_DIR }), 'memory workspace.create');
+    if (wsValue.created) {
+      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: 'QQ 记忆整理' }); } catch {}
+    }
+    const params = { workspaceId: wsValue.workspace.workspaceId };
+    params.agentPreset = preset;
+    const value = unwrap(await api.sessions.create(params), 'memory session.create');
+    memoryDistillerSessionId = value.sessionId;
+    learnerSessions.add(memoryDistillerSessionId);
+    api.events.follow(memoryDistillerSessionId);
+    await ensureChatModel(memoryDistillerSessionId);
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    atomicWriteJson(MEMORY_SESSION_FILE, { sessionId: memoryDistillerSessionId, preset });
+    log(`记忆蒸馏会话已创建：${memoryDistillerSessionId}（preset: ${preset}）`);
+    return memoryDistillerSessionId;
+  }
+
+  function invalidateMemoryDistillerSession() {
+    const oldId = memoryDistillerSessionId;
+    memoryDistillerSessionId = null;
+    if (oldId && !learnerWaiters.has(oldId) && !learnerCollectors.has(oldId)) {
+      learnerSessions.delete(oldId);
+    }
+    if (oldId) api.events.forget?.(oldId);
+    try { fs.unlinkSync(MEMORY_SESSION_FILE); } catch {}
+  }
+
+  let memoryTurnScope = null;
+  async function runMemoryTurn(promptText, timeoutMs = 0) {
+    if (!dshReady) throw new Error('DSH 未就绪');
+    const scope = /scope=(private:\d+)/.exec(promptText)?.[1];
+    if (memoryTurnScope !== scope) { invalidateMemoryDistillerSession(); memoryDistillerTurns = 0; memoryTurnScope = scope; }
+    const deadline = Date.now() + (timeoutMs || distillConfig().timeoutMs);
+    const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) throw new Error('memory deadline'); return ms; };
+    let sessionId;
+    try {
+      sessionId = await withTimeout(ensureMemoryDistillerSession(), remaining(), 'memory session');
+      // Register before prompt submission: a fast turn may finish before RPC returns.
+      const output = waitLearnerTurn(sessionId, remaining());
+      output.catch(() => {});
+      const accepted = await withTimeout(api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] }), remaining(), 'memory prompt');
+      if (!accepted?.result?.ok) throw new Error('记忆蒸馏 prompt 被拒');
+      const result = await output;
+      memoryDistillerTurns += 1;
+      if (memoryDistillerTurns >= distillConfig().maxTurnsPerSession) {
+        invalidateMemoryDistillerSession(); memoryDistillerTurns = 0;
+        void api.workspace.archiveSession({sessionId}).catch(() => {});
+      }
+      return result;
+    } catch (error) {
+      const old = sessionId || memoryDistillerSessionId;
+      invalidateMemoryDistillerSession();
+      if (old) {
+        for (const waiter of learnerWaiters.get(old) || []) { clearTimeout(waiter.timer); waiter.reject(error); }
+        learnerWaiters.delete(old); learnerCollectors.delete(old);
+        void api.stopSessionWork(old).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  function collectTurnTexts(value, out = [], depth = 0) {
+    if (value == null || depth > 6) return out;
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (text) out.push(text);
+      return out;
+    }
+    if (Array.isArray(value)) {
+      for (const v of value) collectTurnTexts(v, out, depth + 1);
+      return out;
+    }
+    if (typeof value !== 'object') return out;
+    const type = String(value.type || value.role || '');
+    if (/tool|thinking|reasoning/i.test(type)) return out;
+    if (typeof value.text === 'string' && value.text.trim()) out.push(value.text.trim());
+    else if (typeof value.content === 'string' && value.content.trim()) out.push(value.content.trim());
+    else if (Array.isArray(value.content)) collectTurnTexts(value.content, out, depth + 1);
+    else if (Array.isArray(value.blocks)) collectTurnTexts(value.blocks, out, depth + 1);
+    if (value.message && typeof value.message === 'object') collectTurnTexts(value.message, out, depth + 1);
+    if (Array.isArray(value.events)) collectTurnTexts(value.events, out, depth + 1);
+    if (Array.isArray(value.items)) collectTurnTexts(value.items, out, depth + 1);
+    return out;
+  }
+
+  function extractPageMessages(page) {
+    const list = page?.events ?? page?.items ?? page?.messages ?? page?.page?.items ?? page?.page?.events ?? [];
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    let last = '';
+    for (const item of list) {
+      const texts = [...new Set(collectTurnTexts(item))];
+      const text = texts.join(' ').replace(/\s+/g, ' ').trim();
+      if (!text || text === last) continue;
+      last = text;
+      const role = String(item?.role ?? item?.event?.role ?? item?.message?.role ?? item?.type ?? item?.event?.type ?? '');
+      const isOut = item?.isSelf === true || /assistant|bot|self|model/i.test(role);
+      out.push({
+        seq: out.length + 1,
+        dir: isOut ? 'out' : 'in',
+        senderName: isOut ? '我' : '对方',
+        text: text.slice(0, 500)
+      });
+    }
+    return out.slice(-60);
+  }
+
+  async function runHandoff(key, sessionId, options = {}) {
+    const deadline = Date.now() + 20000;
+    try {
+      return await withTimeout(enqueueDistill(() => runHandoffQueued(key, sessionId, { ...options, deadline })), 20000, 'handoff');
+    } catch (error) {
+      const scope = memoryScopeForKey(key);
+      if (scope) {
+        const recent = socialV2.conversations.get(key)?.recentMessages || [];
+        const text = fallbackHandoff(recent.map(m => ({ text: m.text, dir: m.isSelf ? 'out' : 'in' })));
+        memoryStore.setHandoff(scope, text, sessionId);
+      }
+      log(`[memory] handoff 回退：${error?.message ?? error}`);
+      return null;
+    }
+  }
+
+  async function runHandoffQueued(key, sessionId, { reason = 'retire', deadline } = {}) {
+    const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) throw new Error('handoff deadline'); return ms; };
+    remaining();
+    if (!sessionId || !key.startsWith('private:')) return null;
+    const scope = memoryScopeForKey(key);
+    if (!scope) return null;
+    const d = distillConfig();
+    let page = null;
+    try {
+      page = unwrap(await withTimeout(api.pageSession({ sessionId, maxMessages: 60 }), remaining(), 'session/page'), 'session/page');
+    } catch {
+      try {
+        page = unwrap(await withTimeout(api.sessions.history({ sessionId, maxMessages: 60 }), remaining(), 'session.history'), 'session.history');
+      } catch {}
+    }
+    const messages = extractPageMessages(page);
+    let text = '';
+    if (messages.length && d.enabled) {
+      try {
+        text = parseHandoffOutput(await runMemoryTurn(buildHandoffPrompt({ scope, messages }), remaining()));
+      } catch (error) {
+        log(`[memory] handoff 蒸馏失败 ${key}：${error?.message ?? error}；改用回退摘要`);
+      }
+    }
+    if (!text) text = fallbackHandoff(messages);
+    if (!text) return null;
+    remaining();
+    memoryStore.setHandoff(scope, text, sessionId);
+    log(`[memory] handoff 已写入 ${key}（${reason}，${messages.length} 条消息）`);
+    return text;
+  }
+
+  async function distillScopeNow(key, { reason = 'auto', force = false } = {}) {
+    const d = distillConfig();
+    if (!memoryEnabled() || (!d.enabled && !force) || !key.startsWith('private:')) return null;
+    const info = archiveScopeForKey(key);
+    if (!info) return null;
+    const scope = info.scope;
+    if (distillRunning.has(scope)) return { ok: false, skipped: 'running', key, scope };
+    distillRunning.add(scope);
+    try {
+      if (!dshReady) return { ok: false, skipped: 'dsh-not-ready', key, scope };
+      const snap = memoryStore.snapshot(scope);
+      // 归档 meta 的 conv 是权威代际；memory 文件可能先在 M2 CLI 里创建（conv=c_unknown），
+      // 不能拿它去过滤归档，否则会读不到任何消息。
+      const conv = archiveStore.getMeta(scope).conv || snap.conv;
+      const lastSeq = archiveStore.stats(scope).lastSeq || 0;
+      const fromSeq = (Number(snap.summarizedThroughSeq) || 0) + 1;
+      if (lastSeq < fromSeq) return { ok: true, skipped: 'no-new-messages', key, scope, fromSeq, lastSeq };
+      let toSeq = Math.min(lastSeq, fromSeq + d.maxMessagesPerRun - 1);
+      const entries = selectDistillWindow(archiveStore.readRange(scope, { conv, fromSeq, toSeq, limit: d.maxMessagesPerRun }));
+      if (!entries.length) {
+        return { ok: false, skipped: 'empty-window', key, scope, fromSeq, toSeq };
+      }
+      toSeq = entries.at(-1).seq;
+      const st = socialV2.conversations.get(key);
+      const promptText = buildDistillPrompt({
+        scope,
+        conv,
+        fromSeq,
+        toSeq,
+        messages: entries,
+        facts: snap.facts,
+        impressions: st?.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : null,
+        rolling: snap.rolling?.text || ''
+      });
+      const raw = await runMemoryTurn(promptText, d.timeoutMs);
+      if (archiveStore.getMeta(scope).conv !== conv) throw new Error("蒸馏期间记忆已重置，丢弃旧结果");
+      const parsed = parseDistillOutput(raw);
+      const applied = applyDistillOutput(memoryStore, scope, parsed, { messages: entries, conv, throughSeq: toSeq, minConfidence: cfg.memory?.facts?.minConfidence ?? 0.6, maxTextChars: cfg.memory?.facts?.maxTextChars ?? 120 });
+      log(`[memory] 蒸馏 ${key} seq ${fromSeq}-${toSeq}：+${applied.added} facts，${applied.updated} 更新，${applied.episodes} episodes${applied.errors.length ? `，${applied.errors.length} 条跳过` : ''}`);
+      if (applied.ok && lastSeq > toSeq) scheduleDistill(key, 5000);
+      return { ok: true, key, scope, fromSeq, toSeq, reason, ...applied };
+    } catch (error) {
+      log(`[memory] 蒸馏失败 ${key}（${reason}）：${error?.message ?? error}`);
+      return { ok: false, key, scope, reason, error: String(error?.message ?? error) };
+    } finally {
+      distillRunning.delete(scope);
+    }
+  }
+
+  function noteArchiveActivity(key) {
+    const d = distillConfig();
+    if (!d.enabled || !key.startsWith('private:')) return;
+    const info = archiveScopeForKey(key);
+    if (!info) return;
+    scheduleIdleDistill(key);
+    const pending = (archiveStore.stats(info.scope).lastSeq || 0) - (memoryStore.stats(info.scope).summarizedThroughSeq || 0);
+    if (pending >= d.everyMessages) scheduleDistill(key, 5000);
+  }
+
+  async function writeDailyDigest(scope, day) {
+    const episodes = memoryStore.listEpisodes(scope, { day, limit: 100 });
+    const facts = memoryStore.listFacts(scope, { status: 'active', limit: 200 })
+      .filter((f) => formatDate(f.updatedAt) === day);
+    if (!episodes.length && !facts.length) return null;
+    const md = renderDailyDigest({ day, scope, episodes, facts });
+    const qq = /^private:(\d+)$/.exec(scope)?.[1] || 'unknown';
+    const dir = path.join(STATE_DIR, 'memory', 'daily', `private_${qq}`);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, `${day}.md`);
+    atomicWriteText(file, md);
+    return file;
+  }
+
+  async function runDailyDistill() {
+    const d = distillConfig();
+    if (!d.enabled) return;
+    const day = dayKey(nowMs() - 86400000);
+    for (const key of new Set([...socialV2.conversations.keys(), ...listArchiveScopes(STATE_DIR)])) {
+      if (!key.startsWith('private:')) continue;
+      let result;
+      do { result = await distillScopeNow(key, { reason: 'daily' }); }
+      while (result?.ok && !result.skipped && result.toSeq < archiveStore.stats(archiveScopeForKey(key).scope).lastSeq);
+      const info = archiveScopeForKey(key);
+      if (info) {
+        try { await writeDailyDigest(info.scope, day); } catch (error) { log(`[memory] 日终摘要失败 ${key}：${error?.message ?? error}`); }
+      }
+    }
+    scheduleDailyDistill();
+  }
+
+  function scheduleDailyDistill() {
+    const d = distillConfig();
+    if (!d.enabled) return;
+    if (distillDailyTimer) { clearTimeout(distillDailyTimer); distillDailyTimer = null; }
+    const now = nowMs();
+    let target = startOfDayMs(now) + d.dailyHour * 3600000 + d.dailyMinute * 60000;
+    if (target <= now) target += 86400000;
+    const timer = setTimeout(() => {
+      distillDailyTimer = null;
+      void enqueueDistill(() => runDailyDistill());
+    }, Math.max(1000, target - now));
+    timer.unref?.();
+    distillDailyTimer = timer;
+  }
+
+  function startDistillScheduler() {
+    const d = distillConfig();
+    if (!d.enabled) {
+      if (!distillSchedulerStarted) {
+        distillSchedulerStarted = true;
+        log('[memory] 蒸馏已关闭（memory.distill.enabled=false）');
+      }
+      return;
+    }
+    if (!distillSchedulerStarted) {
+      for (const key of new Set([...socialV2.conversations.keys(), ...listArchiveScopes(STATE_DIR)])) noteArchiveActivity(key);
+      distillSchedulerStarted = true;
+      scheduleDailyDistill();
+      log(`[memory] 蒸馏调度已启动（每 ${d.everyMessages} 条 / 空闲 ${Math.round(d.idleMs / 60000)} 分钟 / 每日 ${String(d.dailyHour).padStart(2, '0')}:${String(d.dailyMinute).padStart(2, '0')}）`);
     }
   }
 
@@ -8975,7 +9815,10 @@ async function main() {
   }
 
   function formatMemoryContextV2(key, st, opts = {}) {
-    const base = formatMemoryV2(st);
+    const includeImpressions = key.startsWith('private:')
+      ? cfg.memory?.inject?.lightweightImpressions !== false
+      : true;
+    const base = formatMemoryV2(st, { includeImpressions, thoughtIds: key.startsWith('private:') });
     if (!key.startsWith('private:') || !memoryEnabled()) return base;
     const longTerm = buildLongTermMemoryText(key, opts);
     return longTerm ? [longTerm, base].filter(Boolean).join('\n\n') : base;
@@ -9943,6 +10786,7 @@ async function main() {
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
+    if (key.startsWith('private:')) st.unansweredCount = 0;
     st.preSleepWaitSatisfiedAt = 0; // 有新消息进来，之前的“沉睡前已等待/已观察”作废
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
@@ -9992,6 +10836,7 @@ async function main() {
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
+    if (key.startsWith('private:')) st.unansweredCount = 0;
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
@@ -10059,7 +10904,12 @@ async function main() {
         });
       }
     }
+    consumeSurfacedThoughts(key, list);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
+    if (key.startsWith('private:') && ['proactiveCheck', 'thoughtDue'].includes(st.lastWakeReason) && st.unansweredWakeAt !== st.lastAnyWakeAt) {
+      st.unansweredCount = (Number(st.unansweredCount) || 0) + 1;
+      st.unansweredWakeAt = st.lastAnyWakeAt;
+    }
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
@@ -10360,6 +11210,13 @@ async function main() {
       messageText: lastIncomingText
     });
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
+    const surfaced = surfacedThoughts.get(key);
+    const surfacedText = (key.startsWith('private:') && Array.isArray(surfaced?.ids))
+      ? surfaced.ids.map((id) => (st.pendingThoughts || []).find((x) => x && x.id === id)).filter(Boolean)
+      : [];
+    const surfacedLine = surfacedText.length
+      ? `【这次优先说的】\n${surfacedText.map((x) => `- [${x.id}] ${x.text}`).join('\n')}\n\n`
+      : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
@@ -10400,7 +11257,7 @@ async function main() {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + surfacedLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10411,7 +11268,13 @@ async function main() {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'proactiveCheck') {
+      if (key.startsWith('private:')) {
+        return `${base}【主动机会】${key}\n原因：对方已经一段时间没说话了，这是一次你可以主动开口的机会。\n优先用【这次优先说的】/【你之前想说的】里的某一条；没有想法时，从【可聊的引子】里挑一个自然角度。\n一次发起不限条数，以把这次想法说完整为目标；通常 1–3 条，不要为了多而多，也不要把一句完整的话拆碎。\n只要自然就开口；不想说就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      }
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+    }
+    if (reason === 'thoughtDue') {
+      return `${base}【想法到点】${key}\n原因：你之前记下的一个想法到了可以说的时机。\n先看【这次优先说的】/【你之前想说的】；自然就开口，通常 1–3 条。如果现在不想说，用 qq_thought_drop(id) 丢掉，不要硬说。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -10437,6 +11300,9 @@ async function main() {
       return;
     }
     const st = getSocialV2State(key);
+    const proactiveWake = key.startsWith('private:') && ['proactiveCheck', 'thoughtDue'].includes(reason);
+    if (proactiveWake && (!privateProactiveEnabled(key) || privateProactiveBlockReason(key, st, Date.now()))) return;
+
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
     if (isConversationBusyV2(key, st)) {
@@ -10509,10 +11375,15 @@ async function main() {
     st.wakeConfig.lastWakeAt = now;
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
+    const proactiveBefore = { at: st.lastProactiveAt, count: st.proactiveCount, day: st.proactiveDayKey };
+    if (proactiveWake) { st.lastProactiveAt = now; st.proactiveCount += 1; st.proactiveDayKey = dayKey(now); }
+    st.lastAnyWakeAt = now;
+    surfaceThoughtsForKey(key, reason);
     saveSocialV2State();
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
+      if (proactiveWake) { st.lastProactiveAt = proactiveBefore.at; st.proactiveCount = proactiveBefore.count; st.proactiveDayKey = proactiveBefore.day; surfacedThoughts.delete(key); }
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
       saveSocialV2State();
@@ -10629,7 +11500,8 @@ async function main() {
     anyMessage: 50,
     replyCheck: 40,
     timeout: 30,
-    proactiveCheck: 20
+    proactiveCheck: 20,
+    thoughtDue: 25
   };
 
   // 唤醒原因可能带子类型（如 keyword:小鲸鱼、speaker:昵称），取冒号前的基名计算优先级。
@@ -10641,7 +11513,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'thoughtDue', 'bootstrap', 'admin']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -10780,7 +11652,178 @@ async function main() {
     st.proactiveTimer = null;
   }
 
+  function proactiveQuietConfig() {
+    const q = cfg.socialV2?.proactive?.quietHours ?? {};
+    return {
+      start: Math.min(23, Math.max(0, Number(q.start ?? 23))),
+      end: Math.min(23, Math.max(0, Number(q.end ?? 8))),
+      hardBlock: q.hardBlock !== false
+    };
+  }
+
+  function privateProactiveBlockReason(key, st, now) {
+    const p = cfg.socialV2?.proactive ?? {};
+    const q = proactiveQuietConfig();
+    const result = evaluatePrivateProactive({
+      now,
+      st,
+      p,
+      quiet: q,
+      busy: isConversationBusyV2(key, st),
+      isQuietHourFn: isQuietHour,
+      dayKeyFn: dayKey
+    });
+    if (result.resetDay) {
+      st.proactiveDayKey = result.day;
+      st.proactiveCount = 0;
+      saveSocialV2State();
+    }
+    return result.allow ? null : result.reason;
+  }
+
+  function runPrivateProactiveV2(key) {
+    if (!privateProactiveEnabled(key)) return;
+    const st = getSocialV2State(key);
+    const now = Date.now();
+    const p = cfg.socialV2?.proactive ?? {};
+    const blocked = privateProactiveBlockReason(key, st, now);
+    if (blocked) {
+      if (blocked !== 'idle' && blocked !== 'gap' && blocked !== 'cooldown') {
+        log(`[reserved2] 私聊主动机会跳过 ${key}：${blocked}`);
+      }
+      return;
+    }
+    const { fire } = privateProactiveProbability({ p, st, now });
+    if (!fire) return;
+    void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+  }
+
+  function schedulePrivateProactiveV2(key) {
+    const p = cfg.socialV2?.proactive ?? {};
+    if (p.enabled === false) return;
+    if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (!isSessionAllowedInCurrentMode(key)) return;
+    const st = getSocialV2State(key);
+    if (st.proactiveTimer) return;
+    const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
+    const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
+    const delay = Math.floor(min + Math.random() * (max - min));
+    st.proactiveTimer = setTimeout(() => {
+      st.proactiveTimer = null;
+      try { runPrivateProactiveV2(key); } catch (error) { log(`[reserved2] 私聊主动机会异常 ${key}：${error?.message ?? error}`); }
+      schedulePrivateProactiveV2(key);
+    }, delay);
+    st.proactiveTimer.unref?.();
+  }
+
+
+  function surfaceThoughtsForKey(key, reason) {
+    if (!key.startsWith('private:')) return;
+    const base = String(reason || '').split(':')[0];
+    if (base !== 'proactiveCheck' && base !== 'thoughtDue') return;
+    const st = getSocialV2State(key);
+    const thoughts = pickSurfacedThoughts(st.pendingThoughts, base, Date.now());
+    if (!thoughts.length) {
+      surfacedThoughts.delete(key);
+      return;
+    }
+    surfacedThoughts.set(key, { ids: thoughts.map((t) => t.id), reason: base, at: Date.now() });
+  }
+
+
+  function consumeSurfacedThoughts(key, sentTexts) {
+    const ctx = surfacedThoughts.get(key);
+    if (!ctx) return false;
+    const st = getSocialV2State(key);
+    const text = (Array.isArray(sentTexts) ? sentTexts : []).join('\n');
+    const remaining = [];
+    let used = false;
+    for (const id of ctx.ids) {
+      const thought = findThought(st, id);
+      if (!thought) continue;
+      if (thoughtOverlap(text, thought.text)) { markThoughtUsed(key, id); used = true; }
+      else remaining.push(id);
+    }
+    if (remaining.length) ctx.ids = remaining;
+    else surfacedThoughts.delete(key);
+    return used;
+  }
+
+  function finishSurfacedThoughts(key, sendToolSucceeded) {
+    const ctx = surfacedThoughts.get(key);
+    if (!ctx) return;
+    surfacedThoughts.delete(key);
+    const st = getSocialV2State(key);
+    for (const id of ctx.ids) {
+      const thought = findThought(st, id);
+      if (!thought) continue;
+      thought.attempts = (Number(thought.attempts) || 0) + 1;
+      if (thought.attempts >= thoughtConfig().maxAttempts) {
+        removePendingThought(st, id); thought.status = 'dropped'; pushThoughtHistory(st, thought);
+      } else thought.notBefore = Date.now() + 30 * 60000;
+    }
+    saveSocialV2State();
+    scheduleThoughtDueV2(key);
+  }
+
+  function scheduleThoughtDueV2(key) {
+    if (!key.startsWith('private:')) return;
+    if (!privateProactiveEnabled(key)) return;
+    const st = socialV2.conversations.get(key);
+    if (!st) return;
+    if (st.thoughtTimer) { clearTimeout(st.thoughtTimer); st.thoughtTimer = null; }
+    const expired = (st.pendingThoughts || []).filter(t => t.expiresAt && Date.now() >= Number(t.expiresAt));
+    for (const t of expired) { removePendingThought(st, t.id); t.status = 'dropped'; t.reason = 'expired'; pushThoughtHistory(st, t); }
+    if (expired.length) saveSocialV2State();
+    const now = Date.now();
+    const next = (Array.isArray(st.pendingThoughts) ? st.pendingThoughts : [])
+      .filter((x) => x && x.status === 'pending' && (!x.expiresAt || now < Number(x.expiresAt)) )
+      .map((x) => Math.max(now + 1000, Number(x.notBefore) || now + 1000))
+      .filter((x) => Number.isFinite(x) && x > now)
+      .sort((a, b) => a - b)[0];
+    if (!next) return;
+    const q = proactiveQuietConfig();
+    let target = next;
+    if (q.hardBlock && isQuietHour(target, q.start, q.end)) target = nextQuietEndMs(target, q.start, q.end) + Math.floor(Math.random() * 5 * 60000);
+    const delay = Math.min(2147483647, Math.max(1000, target - now));
+    st.thoughtTimer = setTimeout(() => {
+      st.thoughtTimer = null;
+      runThoughtDueV2(key);
+    }, delay);
+    st.thoughtTimer.unref?.();
+  }
+
+  function retryThoughtDueV2(key, delayMs) {
+    const st = socialV2.conversations.get(key);
+    if (!st) return;
+    if (st.thoughtTimer) clearTimeout(st.thoughtTimer);
+    st.thoughtTimer = setTimeout(() => {
+      st.thoughtTimer = null;
+      runThoughtDueV2(key);
+    }, Math.min(2147483647, Math.max(1000, delayMs)));
+    st.thoughtTimer.unref?.();
+  }
+
+  function runThoughtDueV2(key) {
+    if (!privateProactiveEnabled(key)) return;
+    const st = getSocialV2State(key);
+    if (!pickSurfacedThoughts(st.pendingThoughts, 'thoughtDue', Date.now()).length) { scheduleThoughtDueV2(key); return; }
+    const blocked = privateProactiveBlockReason(key, st, Date.now());
+    if (blocked) { retryThoughtDueV2(key, 10 * 60000); return; }
+    void sendWakePromptV2(key, 'thoughtDue').catch(error => log(`[reserved2] thoughtDue: ${error}`));
+  }
+
+  function privateProactiveEnabled(key) {
+    return key.startsWith('private:') && cfg.socialV2?.enabled !== false && cfg.socialV2?.proactive?.enabled !== false &&
+      currentMode === 'reserved2' && !socialV2.paused && isSessionAllowedInCurrentMode(key);
+  }
+
   function scheduleProactiveCheckV2(key) {
+    // M5：私聊走新的配额/间隔/静默硬阻断调度；群聊保持原有逻辑（I1）。
+    if (String(key).startsWith('private:')) {
+      schedulePrivateProactiveV2(key);
+      return;
+    }
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
@@ -10834,6 +11877,11 @@ async function main() {
       clearTimeout(st.proactiveTimer);
       st.proactiveTimer = null;
     }
+    if (st.thoughtTimer) {
+      clearTimeout(st.thoughtTimer);
+      st.thoughtTimer = null;
+    }
+    surfacedThoughts.delete(key);
     if (st.rateLimitRetryTimer) {
       clearTimeout(st.rateLimitRetryTimer);
       st.rateLimitRetryTimer = null;
@@ -10980,7 +12028,9 @@ async function main() {
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
-          // 与 retireSession 一致：先终止 DSH 侧排队的工作，再归档（归档只隐藏会话）。
+          // 与 retireSession 一致：先写交接摘要，再终止 DSH 侧排队的工作、归档。
+          try { await runHandoff(key, old, { reason: 'command-reset' }); }
+          catch (error) { log(`[memory] handoff 失败 ${key}：${error?.message ?? error}`); }
           try { await withTimeout(api.stopSessionWork(old), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); }
           catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
           try { await withTimeout(api.workspace.archiveSession({ sessionId: old }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
@@ -11459,7 +12509,7 @@ async function main() {
                     }
                   }
                   // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId) learnerSessions.delete(frame.sessionId);
+                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== memoryDistillerSessionId) learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;
@@ -11576,6 +12626,7 @@ async function main() {
                 log(`摘要投喂 turn 结束，静默 (${key})`);
                 continue;
               }
+              finishSurfacedThoughts(key, sendToolSucceeded);
               // reserved2 防遗忘：每次唤醒回合结束时，若 AI 没有调用 qq_set_wake_config 设置下一次唤醒条件，
               // 则发送提醒；连续未设置达到上限后重置为默认唤醒配置。静默/后台提醒回合已在上方 continue，不触发。
               if (pendingWakeKeys.has(key)) {

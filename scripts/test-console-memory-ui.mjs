@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const html=fs.readFileSync(new URL('../public/console.html',import.meta.url),'utf8');
+const ids=new Set([...html.matchAll(/id="([^"]+)"/g)].map(m=>m[1]));
+const elements=new Map();
+function element(id){assert.ok(ids.has(id),`missing DOM id ${id}`);if(!elements.has(id)) elements.set(id,{textContent:'',innerHTML:'',className:'',value:'',addEventListener(){}});return elements.get(id);}
+let pending=[];
+const context=vm.createContext({document:{getElementById:element},api:(url)=>new Promise(resolve=>pending.push({url,resolve})),esc:s=>String(s).replaceAll('<','&lt;'),console});
+const source=html.slice(html.indexOf('// ── M6 记忆与备份 ─'),html.indexOf('// 上游静默时长'));
+vm.runInContext(source,context);
+const first=context.loadMemoryScope('private:1');const second=context.loadMemoryScope('private:2');
+pending[1].resolve({ok:true,facts:[{id:'f_2',text:'新会话',status:'active'}],stats:{},formatted:'new'});await second;
+pending[0].resolve({ok:true,facts:[{id:'f_1',text:'旧会话',status:'active'}],stats:{},formatted:'old'});await first;
+assert.ok(element('memoryFacts').innerHTML.includes('新会话'));assert.ok(!element('memoryFacts').innerHTML.includes('旧会话'));
+context.memoryMsg('已备份','ok');const third=context.loadMemoryScope('private:2');pending[2].resolve({ok:true,facts:[],stats:{}});await third;assert.equal(element('memoryActionMsg').textContent,'已备份');
+const failed=context.memoryPost('/x',{});pending[3].resolve({ok:false,errors:['停止失败'],backupDir:'/backup'});await assert.rejects(failed,/停止失败.*备份/);
+await context.loadMemoryScope('');assert.equal(element('memoryRaw').textContent,'');
+for(const match of html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g))new vm.Script(match[1]);
+console.log('PASS M6 UI: actual DOM IDs, stale response isolation, persistent success, partial failure details, empty state and script syntax');

@@ -443,6 +443,7 @@ export function createArchiveStore(options = {}) {
     getMeta,
     markBackfilled,
     rotateConv,
+    invalidate(scope) { scopes.delete(scope); },
     flush,
     flushAll,
     rebuildIndex

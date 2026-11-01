@@ -19,6 +19,8 @@ import { formatDate } from './time.js';
 import { scopeForKey } from './archive-log.js';
 
 const VERSION = 1;
+const EPISODE_CAP = 400;
+const ARCHIVED_EPISODE_CAP = 800;
 const KINDS = new Set(['person', 'preference', 'agreement', 'event', 'rule']);
 const STATUSES = new Set(['active', 'superseded', 'retracted', 'archived']);
 const MAX_EVIDENCE = 5;
@@ -76,7 +78,7 @@ function normalizeFact(raw, now) {
     text: normalizeText(f.text),
     keywords: normalizeKeywords(f.keywords),
     evidence: normalizeEvidence(f.evidence, now),
-    confidence: Math.min(1, Math.max(0, Number(f.confidence) || 0.6)),
+    confidence: Math.min(1, Math.max(0, (Number.isFinite(Number(f.confidence)) ? Number(f.confidence) : 0.6))),
     salience: Math.min(5, Math.max(1, Number(f.salience) || 3)),
     pinned: f.pinned === true,
     status,
@@ -119,6 +121,7 @@ function defaultDoc(scope, conv, now) {
     facts: [],
     archivedFacts: [],
     episodes: [],
+    archivedEpisodes: [],
     rolling: { text: '', throughSeq: 0, updatedAt: 0 },
     handoff: null,
     createdAt: now,
@@ -138,6 +141,7 @@ function normalizeDoc(raw, scope, conv, now) {
     facts: (Array.isArray(doc.facts) ? doc.facts : []).map((f) => normalizeFact(f, now)),
     archivedFacts: (Array.isArray(doc.archivedFacts) ? doc.archivedFacts : []).map((f) => normalizeFact(f, now)),
     episodes: (Array.isArray(doc.episodes) ? doc.episodes : []).map((e) => normalizeEpisode(e, now)),
+    archivedEpisodes: (Array.isArray(doc.archivedEpisodes) ? doc.archivedEpisodes : []).map((e) => normalizeEpisode(e, now)),
     rolling: doc.rolling && typeof doc.rolling === 'object'
       ? { text: clip(doc.rolling.text, 1000), throughSeq: Number(doc.rolling.throughSeq) || 0, updatedAt: Number(doc.rolling.updatedAt) || 0 }
       : { text: '', throughSeq: 0, updatedAt: 0 },
@@ -219,6 +223,7 @@ export function createMemoryStore(options = {}) {
   const log = typeof options.log === 'function' ? options.log : () => {};
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
 
+  const transactions = new Set();
   const cache = new Map(); // scope -> doc
   const readOnly = new Map(); // scope -> true
   const warned = new Set();
@@ -245,7 +250,7 @@ export function createMemoryStore(options = {}) {
     const doc = cache.get(scope);
     if (!doc) return false;
     doc.updatedAt = now();
-    atomicWriteJson(filePath(scope), doc);
+    if (!transactions.has(scope)) atomicWriteJson(filePath(scope), doc);
     return true;
   }
 
@@ -331,7 +336,7 @@ export function createMemoryStore(options = {}) {
     const dedupeKey = `${kind}|${subject}|${text}`;
     const existing = doc.facts.find((f) => f.status === 'active' && `${f.kind}|${f.subject}|${f.text}` === dedupeKey);
     if (existing && supersedes.length === 0) {
-      existing.confidence = Math.max(existing.confidence, Math.min(1, Math.max(0, Number(input.confidence) || 0.6)));
+      existing.confidence = Math.max(existing.confidence, Math.min(1, Math.max(0, (Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : 0.6))));
       existing.salience = Math.max(existing.salience, Math.min(5, Math.max(1, Number(input.salience) || 3)));
       existing.pinned = existing.pinned || input.pinned === true;
       const extraKeywords = normalizeKeywords(input.keywords);
@@ -514,6 +519,127 @@ export function createMemoryStore(options = {}) {
     return clip(lines.join('\n'), Math.max(200, Math.min(6000, Number(maxChars) || 2000)));
   }
 
+  function addEpisode(scope, input = {}) {
+    if (readOnly.get(scope)) return null;
+    const doc = load(scope);
+    const t = now();
+    const ep = normalizeEpisode({
+      ...input,
+      day: input.day || formatDate(t),
+      conv: input.conv ?? doc.conv
+    }, t);
+    if (!ep.summary) return null;
+    const existing = doc.episodes.find((e) => e.day === ep.day && e.summary === ep.summary);
+    if (existing) {
+      existing.seqFrom = existing.seqFrom ? Math.min(existing.seqFrom, ep.seqFrom || existing.seqFrom) : ep.seqFrom;
+      existing.seqTo = Math.max(existing.seqTo || 0, ep.seqTo || 0);
+      existing.participants = [...new Set([...(existing.participants || []), ...(ep.participants || [])])].slice(0, 10);
+      existing.keywords = [...new Set([...(existing.keywords || []), ...(ep.keywords || [])])].slice(0, 8);
+      doc.updatedAt = t;
+      save(scope);
+      return { episode: existing, updated: true };
+    }
+    doc.episodes.push(ep);
+    if (doc.episodes.length > EPISODE_CAP) {
+      doc.archivedEpisodes.push(...doc.episodes.splice(0, doc.episodes.length - EPISODE_CAP));
+      if (doc.archivedEpisodes.length > ARCHIVED_EPISODE_CAP) {
+        doc.archivedEpisodes.splice(0, doc.archivedEpisodes.length - ARCHIVED_EPISODE_CAP);
+      }
+    }
+    doc.updatedAt = t;
+    save(scope);
+    return { episode: ep, updated: false };
+  }
+
+  function listEpisodes(scope, { day = '', limit = 50 } = {}) {
+    const doc = load(scope);
+    const max = Math.max(1, Math.min(500, Number(limit) || 50));
+    return doc.episodes
+      .filter((e) => !day || e.day === day)
+      .slice(-max)
+      .map((e) => ({ ...e }));
+  }
+
+  function setRolling(scope, text, throughSeq = 0) {
+    if (readOnly.get(scope)) return false;
+    const doc = load(scope);
+    doc.rolling = { text: clip(text, 1000), throughSeq: Number.isSafeInteger(throughSeq) ? throughSeq : 0, updatedAt: now() };
+    doc.updatedAt = now();
+    save(scope);
+    return true;
+  }
+
+  function setHandoff(scope, text, fromSessionId = null) {
+    if (readOnly.get(scope)) return false;
+    const doc = load(scope);
+    doc.handoff = {
+      fromSessionId: fromSessionId != null ? clip(fromSessionId, 80) : null,
+      text: clip(text, 300),
+      createdAt: now()
+    };
+    doc.updatedAt = now();
+    save(scope);
+    return true;
+  }
+
+  function setSummarizedThroughSeq(scope, seq) {
+    if (readOnly.get(scope)) return false;
+    const doc = load(scope);
+    const next = Number.isSafeInteger(seq) ? seq : 0;
+    doc.summarizedThroughSeq = Math.max(Number(doc.summarizedThroughSeq) || 0, next);
+    doc.updatedAt = now();
+    save(scope);
+    return true;
+  }
+
+  function dropFacts(scope, ids = []) {
+    if (readOnly.get(scope)) return 0;
+    const doc = load(scope);
+    const set = new Set((Array.isArray(ids) ? ids : []).map(String));
+    let count = 0;
+    const t = now();
+    for (const fact of doc.facts) {
+      if (fact.status === 'active' && set.has(fact.id)) {
+        fact.status = 'archived';
+        fact.validTo = t;
+        fact.updatedAt = t;
+        count += 1;
+      }
+    }
+    if (count) { doc.updatedAt = t; save(scope); }
+    return count;
+  }
+
+  function transaction(scope, fn) {
+    const before = JSON.parse(JSON.stringify(load(scope)));
+    if (readOnly.get(scope)) throw new Error('memory 只读');
+    if (transactions.has(scope)) throw new Error('nested memory transaction');
+    transactions.add(scope);
+    try {
+      const result = fn();
+      transactions.delete(scope);
+      if (!save(scope)) throw new Error('memory 保存失败');
+      return result;
+    } catch (error) {
+      transactions.delete(scope);
+      cache.set(scope, before);
+      throw error;
+    }
+  }
+
+  function snapshot(scope) {
+    const doc = load(scope);
+    return {
+      scope,
+      conv: doc.conv,
+      summarizedThroughSeq: doc.summarizedThroughSeq,
+      rolling: { ...doc.rolling },
+      handoff: doc.handoff ? { ...doc.handoff } : null,
+      facts: doc.facts.filter((f) => f.status === 'active').map((f) => ({ ...f })),
+      episodes: doc.episodes.slice(-50).map((e) => ({ ...e }))
+    };
+  }
+
   function stats(scope) {
     const doc = load(scope);
     const active = activeFacts(doc);
@@ -522,7 +648,7 @@ export function createMemoryStore(options = {}) {
       conv: doc.conv,
       active: active.length,
       pinned: active.filter((f) => f.pinned).length,
-      archived: doc.archivedFacts.length,
+      archived: doc.archivedFacts.length + doc.facts.filter(f => f.status === 'archived').length,
       episodes: doc.episodes.length,
       factsTotal: doc.facts.length,
       readOnly: !!readOnly.get(scope),
@@ -589,7 +715,21 @@ export function createMemoryStore(options = {}) {
     formatForGetPrompt,
     stats,
     listFacts,
-    importImpressions
+    listEpisodes,
+    addEpisode,
+    setRolling,
+    setHandoff,
+    setSummarizedThroughSeq,
+    dropFacts,
+    snapshot,
+    transaction,
+    importImpressions,
+    /** 重置/轮换 conv 后丢弃内存缓存，下一次 load 重新读盘。 */
+    invalidate(scope) {
+      cache.delete(scope);
+      readOnly.delete(scope);
+      warned.delete(scope);
+    }
   };
 }
 

@@ -1772,6 +1772,7 @@ button:active:not(:disabled) {
       <button data-view="social-v1" class="nav-item"><span class="nav-icon" aria-hidden="true">◇</span>一代仿真<span class="nav-note">V1</span></button>
       <button data-view="slang" class="nav-item"><span class="nav-icon" aria-hidden="true">▤</span>黑话词库</button>
       <div class="nav-label">管理</div>
+      <button data-view="memory" class="nav-item"><span class="nav-icon" aria-hidden="true">▦</span>记忆与备份<span class="nav-note">M6</span></button>
       <button data-view="usage" class="nav-item"><span class="nav-icon" aria-hidden="true">◧</span>令牌与花费</button>
       <button data-view="access" class="nav-item"><span class="nav-icon" aria-hidden="true">⊙</span>访问与安全</button>
       <button data-view="operations" class="nav-item"><span class="nav-icon" aria-hidden="true">⌘</span>调试与运维</button>
@@ -2555,6 +2556,53 @@ button:active:not(:disabled) {
         <span class="meta" id="aiNotifyMsg"></span>
       </div>
     </section>
+<section id="section-memory" data-page="memory" class="card span-all">
+      <h2>记忆与备份</h2>
+      <div class="meta">长期记忆（facts / episodes）、原始归档与想法按私聊 scope 汇总。重置前会自动备份；恢复需停机走 CLI，建议先另存当前状态。</div>
+      <div class="overview-summary" style="margin-top:12px">
+        <div class="metric"><span>私聊 scope</span><strong id="memMetricScopes">—</strong><small>有会话或归档的私聊</small></div>
+        <div class="metric"><span>活跃结论</span><strong id="memMetricFacts">—</strong><small>facts（不含已归档）</small></div>
+        <div class="metric"><span>事件档案</span><strong id="memMetricEpisodes">—</strong><small>episodes</small></div>
+        <div class="metric"><span>归档</span><strong id="memMetricArchive">—</strong><small id="memMetricArchiveHint">行 / 体积</small></div>
+        <div class="metric"><span>待说想法</span><strong id="memMetricThoughts">—</strong><small>pendingThoughts</small></div>
+        <div class="metric"><span>备份</span><strong id="memMetricBackups">—</strong><small>最近 10 份</small></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <label style="flex:0 0 auto">私聊会话</label>
+        <select id="memoryScope" style="flex:1;max-width:420px"></select>
+        <button id="memoryRefresh" class="small">刷新</button>
+        <button id="memoryBackup" class="small">立即备份</button>
+        <label class="meta" style="flex:0 0 auto"><input type="checkbox" id="memoryBackupArchive"> 含归档</label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="memoryDistill" class="small">蒸馏一次</button>
+        <button id="memoryImport" class="small">导入印象（dry-run）</button>
+        <button id="memoryResetSession" class="small">重置会话（保留长期记忆）</button>
+        <button id="memoryResetAll" class="small danger">重置全部私聊记忆</button>
+        <span class="meta" id="memoryActionMsg"></span>
+        <span class="meta" id="memoryScopeStatus"></span>
+      </div>
+      <h3 style="margin-top:18px">长期记忆</h3>
+      <div id="memoryFacts" class="tool-log-table">先选一个私聊会话。</div>
+      <details class="settings-group" open>
+        <summary>手动新增一条 fact</summary>
+        <div class="settings-content">
+          <div class="row">
+            <select id="memoryFactKind"><option value="person">person</option><option value="preference">preference</option><option value="agreement">agreement</option><option value="event">event</option><option value="rule">rule</option></select>
+            <input id="memoryFactSubject" placeholder="subject（可空）" style="flex:0 1 180px">
+            <input id="memoryFactText" placeholder="一句可独立阅读的结论" style="flex:1">
+            <button id="memoryFactAdd" class="small">新增</button>
+          </div>
+          <div class="meta">人工新增 source=operator；蒸馏结论 source=distiller。敏感信息不要写。</div>
+        </div>
+      </details>
+      <details class="settings-group">
+        <summary>备份列表</summary>
+        <div class="settings-content"><div id="memoryBackups" class="tool-log-table">加载中…</div></div>
+      </details>
+      <details class="settings-group"><summary>事件摘要</summary><div id="memoryEpisodes" class="settings-content"></div></details>
+      <pre id="memoryRaw" style="white-space:pre-wrap;max-height:280px;overflow:auto;margin-top:12px"></pre>
+    </section>
 <section id="section-usage" data-page="usage" class="card span-all">
       <h2 data-note="每 3 秒自动同步">令牌与花费</h2>
       <div class="meta">数据来源是 DSH 会话事件里的 provider usage。<b>累计总量</b>取 <code>tokenUsage</code> 投影（整条会话日志的权威累计，含桥接启动前的历史）；<b>逐轮明细</b>由 <code>assistant/message</code> 的 usage 折叠而来，能追溯到多深取决于会话开场快照带回的历史条数。金额按 DeepSeek 官方价目表折算，区分高峰 / 空闲时段（高峰单价为空闲的 2 倍）。</div>
@@ -2670,6 +2718,114 @@ async function api(path, method, body, _retried = 0) {
   return res.json();
 }
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// ── M6 记忆与备份 ──────────────────────────────────────────────────────────
+let memorySelectedKey = '';
+let memoryScopeRequest = 0;
+let memoryPageRequest = 0;
+let memoryBusy = false;
+function memoryAction(id, handler) {
+  document.getElementById(id).addEventListener('click', async event => {
+    if (memoryBusy) return;
+    memoryBusy = true;
+    const controls = [...document.querySelectorAll('#section-memory button, #section-memory select')];
+    const previous = controls.map(el => el.disabled);
+    controls.forEach(el => el.disabled = true);
+    try { await handler(event); }
+    finally { controls.forEach((el, i) => el.disabled = previous[i]); memoryBusy = false; }
+  });
+}
+function memoryBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return v + ' B';
+  if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+  if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB';
+  return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function memoryMsg(text, cls = '') {
+  const el = document.getElementById('memoryActionMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'meta ' + cls;
+}
+function renderMemoryBackups(data) {
+  const box = document.getElementById('memoryBackups');
+  if (!box) return;
+  const list = Array.isArray(data?.backups) ? data.backups : [];
+  if (!list.length) { box.innerHTML = '（还没有备份）'; return; }
+  box.innerHTML = '<table><thead><tr><th>时间</th><th>文件</th><th>归档</th><th>目录</th></tr></thead><tbody>' + list.map((b) => {
+    const m = b.manifest || {};
+    const count = m.counts?.files ?? m.files?.length ?? 0;
+    return `<tr><td>${esc(m.createdAtCst || b.name)}</td><td class="num">${esc(count)}</td><td>${m.includeArchive ? '含' : '不含'}</td><td class="meta">${esc(b.name)}</td></tr>`;
+  }).join('') + '</tbody></table>';
+}
+function renderMemoryFacts(data) {
+  const box = document.getElementById('memoryFacts');
+  if (!box) return;
+  const facts = Array.isArray(data?.facts) ? data.facts : [];
+  if (!facts.length) { box.innerHTML = '（这个 scope 还没有长期记忆）'; return; }
+  const sorted = [...facts].sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (Number(b.salience) - Number(a.salience)) || (Number(b.updatedAt) - Number(a.updatedAt)));
+  box.innerHTML = '<table><thead><tr><th>id</th><th>kind</th><th>subject</th><th>结论</th><th>状态</th><th>操作</th></tr></thead><tbody>' + sorted.map((f) => {
+    const status = f.status || 'active';
+    const pinLabel = f.pinned ? '取消置顶' : '置顶';
+    return `<tr><td class="meta">${esc(f.id)}</td><td>${esc(f.kind)}</td><td>${esc(f.subject || '')}</td><td>${esc(f.text)}${f.pinned ? ' <b>PIN</b>' : ''}</td><td>${esc(status)}</td><td><button class="small" data-memory-pin="${esc(f.id)}" ${data.stats?.readOnly || status !== 'active' ? 'disabled' : ''} data-pinned="${f.pinned ? '1' : '0'}">${pinLabel}</button> <button class="small" data-memory-forget="${esc(f.id)}" ${data.stats?.readOnly || status !== 'active' ? 'disabled' : ''}>撤回</button></td></tr>`;
+  }).join('') + '</tbody></table>';
+}
+async function loadMemoryScope(key) {
+  memorySelectedKey = key || '';
+  const request = ++memoryScopeRequest;
+  const selected = memorySelectedKey;
+  const box = document.getElementById('memoryFacts');
+  if (!memorySelectedKey) {
+    if (box) box.textContent = '先选一个私聊会话。';
+    const raw = document.getElementById('memoryRaw');
+    if (raw) raw.textContent = '';
+    document.getElementById('memoryScopeStatus').textContent = '';
+    document.getElementById('memoryEpisodes').textContent = '';
+    return;
+  }
+  if (box) box.textContent = '读取中…';
+  const data = await api('/api/memory/scope?key=' + encodeURIComponent(memorySelectedKey));
+  if (request !== memoryScopeRequest || selected !== memorySelectedKey) return;
+  if (!data.ok) throw new Error(data.error || '读取记忆失败');
+  renderMemoryFacts(data);
+  document.getElementById('memoryEpisodes').innerHTML = (data.episodes || []).map(e => `<p><b>${esc(e.day)}</b> ${esc(e.summary)}</p>`).join('') || '（暂无事件摘要）';
+  const raw = document.getElementById('memoryRaw');
+  if (raw) raw.textContent = data.formatted || '';
+  const stats = data.stats || {};
+  document.getElementById('memoryScopeStatus').textContent = `${memorySelectedKey}：active ${stats.active || 0} / pinned ${stats.pinned || 0} / archived ${stats.archived || 0} / episodes ${stats.episodes || 0}${stats.readOnly ? '（只读降级）' : ''}`;
+}
+async function loadMemoryPage() {
+  const request = ++memoryPageRequest;
+  const result = await api('/api/memory/scopes');
+  if (request !== memoryPageRequest) return;
+  if (!result.ok) throw new Error(result.error || '读取记忆总览失败');
+  const totals = result.totals || {};
+  document.getElementById('memMetricScopes').textContent = totals.scopes ?? 0;
+  document.getElementById('memMetricFacts').textContent = totals.facts ?? 0;
+  document.getElementById('memMetricEpisodes').textContent = totals.episodes ?? 0;
+  document.getElementById('memMetricArchive').textContent = String(totals.archiveLines ?? 0) + ' 行';
+  document.getElementById('memMetricArchiveHint').textContent = memoryBytes(totals.archiveBytes || 0);
+  document.getElementById('memMetricThoughts').textContent = totals.thoughts ?? 0;
+  const select = document.getElementById('memoryScope');
+  const scopes = Array.isArray(result.scopes) ? result.scopes : [];
+  const keep = scopes.some((s) => s.key === memorySelectedKey) ? memorySelectedKey : (scopes[0]?.key || '');
+  select.innerHTML = scopes.map((s) => `<option value="${esc(s.key)}">${esc(s.key)}（facts ${s.memory?.active || 0}${s.archive?.totalLines ? `，归档 ${s.archive.totalLines}` : ''}）</option>`).join('');
+  select.value = keep;
+  memorySelectedKey = keep;
+  if (keep) await loadMemoryScope(keep);
+  else await loadMemoryScope('');
+  const backups = await api('/api/memory/backups');
+  if (!backups.ok) throw new Error(backups.error || '读取备份失败');
+  if (request !== memoryPageRequest) return;
+  renderMemoryBackups(backups);
+  document.getElementById('memMetricBackups').textContent = Array.isArray(backups.backups) ? backups.backups.length : 0;
+}
+async function memoryPost(path, body) {
+  const data = await api(path, 'POST', body);
+  if (!data.ok) throw new Error([data.error || '操作失败', ...(data.errors || []), data.backupDir ? `备份：${data.backupDir}` : ''].filter(Boolean).join('；'));
+  return data;
+}
+
 // 上游静默时长的人话渲染：只用于 SnowLuma 健康提示（秒 / 分钟 / 小时）。
 function fmtAgoMs(ms) {
   if (ms === null || ms === undefined || ms === '') return '未知';
@@ -4420,6 +4576,95 @@ async function changeConsoleToken(generate) {
   msg.className = 'meta ok';
 }
 document.getElementById('consoleTokenSave').addEventListener('click', () => changeConsoleToken(false));
+// ── M6 记忆与备份交互 ──────────────────────────────────────────────────────
+document.getElementById('memoryRefresh').addEventListener('click', () => {
+  loadMemoryPage().catch((error) => memoryMsg(error?.message || String(error), 'err'));
+});
+document.getElementById('memoryScope').addEventListener('change', (event) => {
+  loadMemoryScope(event.target.value).catch((error) => memoryMsg(error?.message || String(error), 'err'));
+});
+memoryAction('memoryBackup', async () => {
+  try {
+    const includeArchive = document.getElementById('memoryBackupArchive').checked;
+    const data = await memoryPost('/api/memory/backup', { includeArchive });
+    memoryMsg(`已备份：${data.dir}`, 'ok');
+    await loadMemoryPage();
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryDistill', async () => {
+  if (!memorySelectedKey) return memoryMsg('先选一个会话', 'err');
+  if (!confirm(`现在蒸馏 ${memorySelectedKey}？会调用一次模型，可能产生费用。`)) return;
+  try {
+    memoryMsg('蒸馏中…');
+    const data = await memoryPost('/api/memory/distill', { key: memorySelectedKey });
+    memoryMsg(data.skipped ? `无需蒸馏：${data.skipped}` : `蒸馏完成：+${data.added || 0} facts，${data.updated || 0} 更新，${data.episodes || 0} episodes`, 'ok');
+    await loadMemoryPage();
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryImport', async () => {
+  if (!memorySelectedKey) return memoryMsg('先选一个会话', 'err');
+  try {
+    const data = await memoryPost('/api/memory/import-impressions', { key: memorySelectedKey, dryRun: true });
+    const n = Array.isArray(data.candidates) ? data.candidates.length : 0;
+    memoryMsg(`预览：${n} 条候选，尚未写入。`, 'ok');
+    document.getElementById('memoryRaw').textContent = JSON.stringify(data.candidates || [], null, 2);
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryResetSession', async () => {
+  if (!memorySelectedKey) return memoryMsg('先选一个会话', 'err');
+  if (!confirm(`重置 ${memorySelectedKey} 的会话（保留长期记忆）？会创建备份并停止/归档 DSH 会话。`)) return;
+  try {
+    memoryMsg('重置中…');
+    const data = await memoryPost('/api/memory/reset', { scope: 'session', key: memorySelectedKey, includeLongTerm: false, includeArchive: false });
+    memoryMsg(`已重置，备份：${data.backupDir || '无'}`, 'ok');
+    await loadMemoryPage();
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryResetAll', async () => {
+  if (!confirm('清空全部私聊记忆（facts/episodes/归档/会话）？会先创建备份，确认继续？')) return;
+  try {
+    memoryMsg('重置全部私聊记忆中…');
+    const data = await memoryPost('/api/memory/reset', { scope: 'private', includeLongTerm: true, includeArchive: true });
+    memoryMsg(`已重置 ${data.keys?.length || 0} 个 scope，备份：${data.backupDir || '无'}`, 'ok');
+    await loadMemoryPage();
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryFactAdd', async () => {
+  if (!memorySelectedKey) return memoryMsg('先选一个会话', 'err');
+  const text = document.getElementById('memoryFactText').value.trim();
+  if (!text) return memoryMsg('结论不能为空', 'err');
+  try {
+    await memoryPost('/api/memory/fact', {
+      key: memorySelectedKey,
+      kind: document.getElementById('memoryFactKind').value,
+      subject: document.getElementById('memoryFactSubject').value.trim(),
+      text,
+      confidence: 0.7,
+      salience: 3
+    });
+    document.getElementById('memoryFactText').value = '';
+    memoryMsg('已新增 fact', 'ok');
+    await loadMemoryScope(memorySelectedKey);
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+memoryAction('memoryFacts', async (event) => {
+  const pin = event.target.closest('[data-memory-pin]');
+  const forget = event.target.closest('[data-memory-forget]');
+  if (!pin && !forget) return;
+  if (!memorySelectedKey) return;
+  try {
+    if (pin) {
+      await memoryPost('/api/memory/pin', { key: memorySelectedKey, id: pin.dataset.memoryPin, pinned: pin.dataset.pinned !== '1' });
+      await loadMemoryScope(memorySelectedKey);
+    } else {
+      if (!confirm('撤回这条长期记忆？')) return;
+      await memoryPost('/api/memory/forget', { key: memorySelectedKey, id: forget.dataset.memoryForget });
+      memoryMsg('已撤回', 'ok');
+      await loadMemoryScope(memorySelectedKey);
+    }
+  } catch (error) { memoryMsg(error?.message || String(error), 'err'); }
+});
+
 document.getElementById('consoleTokenRandom').addEventListener('click', () => changeConsoleToken(true));
 
 // Presentation layer: keep every existing control mounted so drafts and API contracts survive navigation.
@@ -4430,6 +4675,7 @@ const consolePages = {
   'social-v2': ['二代仿真', '自主参与，恰到好处。', '管理 AI 的工具、唤醒与发言节奏。展开需要调整的分组，修改后保存参数。'],
   'social-v1': ['一代仿真', '为自然对话，设定合适的节奏。', '调整参与概率、活跃周期和分条发送；所有配置项完整保留。'],
   slang: ['黑话词库', '读懂群聊里的，言外之意。', '从候选到确认，让 AI 逐渐熟悉大家的表达习惯。'],
+  memory: ['记忆与备份', '让记得的事，随时看得见。', '按私聊 scope 查看长期记忆、原始归档与想法，手动策展、蒸馏、重置或备份。'],
   usage: ['令牌与花费', '每一次思考，都算得清楚。', '实时查看 AI 的 token 消耗与花费，可下钻到每个群、每个好友、每一轮对话。'],
   access: ['访问与安全', '明确边界，安心连接。', '管理允许对话的对象、管理员权限与控制台访问凭证。'],
   operations: ['调试与运维', '让桥接，始终井然有序。', '测试消息、引导 AI，或维护桥接进程与会话工作区。'],
@@ -4462,6 +4708,12 @@ function setConsolePage(page, { updateHash = true, focus = false, target = '' } 
   closeConsoleSearch();
   // 语音库按需加载：进入二代仿真页时才探测（避免每次开控制台都压网关）。
   if (page === 'social-v2' && typeof loadVoiceLibrary === 'function') loadVoiceLibrary();
+  if (page === 'memory' && typeof loadMemoryPage === 'function') {
+    loadMemoryPage().catch((error) => {
+      const el = document.getElementById('memoryActionMsg');
+      if (el) el.textContent = error?.message || String(error);
+    });
+  }
   if (focus) {
     document.getElementById('mainContent').focus({ preventScroll: true });
     document.getElementById(target || 'mainContent')?.scrollIntoView({ block: 'start', behavior: 'instant' });

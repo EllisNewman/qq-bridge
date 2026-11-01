@@ -14,7 +14,9 @@
     "test:time": "node scripts/test-time.mjs",
     "test:archive": "node scripts/test-archive-log.mjs",
     "test:memory": "node scripts/test-memory-store.mjs",
+    "test:reset": "node scripts/test-memory-reset.mjs && node scripts/test-memory-reset-http.mjs",
     "memory-cli": "node scripts/memory-cli.mjs",
+    "memory-reset": "node scripts/memory-reset.mjs",
     "test:token": "node scripts/test-token-economy.mjs && node scripts/test-reply-wait.mjs && node scripts/test-qq-model-view.mjs && node scripts/test-qq-preset-contract.mjs",
     "test:tokens": "node scripts/test-token-usage.mjs",
     "test:hardening": "node scripts/test-hardening.mjs",
@@ -62,7 +64,10 @@
     "privacy-scan": "node scripts/privacy-scan.mjs",
     "diagnose:acl": "node scripts/diagnose-acl.mjs",
     "harden-acl": "node scripts/harden-state-acl.mjs",
-    "test:context": "node scripts/test-conversation-context.mjs"
+    "test:context": "node scripts/test-conversation-context.mjs",
+    "test:distill": "node scripts/test-memory-distill.mjs && node scripts/test-memory-distill-scheduler.mjs",
+    "test:proactive": "node scripts/test-proactive-private.mjs && node scripts/test-proactive-integration.mjs",
+    "test:console-memory": "node scripts/test-console-memory.mjs && node scripts/test-console-memory-http.mjs && node scripts/test-console-memory-ui.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-host-apiproxy": "0.1.1-rc.2",
