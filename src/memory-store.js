@@ -240,6 +240,7 @@ export function createMemoryStore(options = {}) {
   }
 
   function save(scope) {
+    if (options.readOnly === true) return false;
     if (readOnly.get(scope)) {
       if (!warned.has(scope)) {
         warned.add(scope);

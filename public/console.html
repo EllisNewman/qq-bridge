@@ -2537,7 +2537,7 @@ button:active:not(:disabled) {
         <button id="clearWsBtn" class="danger">清空 QQ 聊天工作区</button>
         <span class="meta" id="clearWsMsg"></span>
       </div>
-      <div class="meta">由守护窗口启动时，重启后 5 秒自动恢复；清空工作区会归档全部 QQ 会话并清空活动日志。</div>
+      <div class="meta">由守护窗口启动时，重启后 5 秒自动恢复；清空工作区会先备份状态，再停止并归档全部 QQ 会话；活动日志保留。</div>
     </section>
 <section id="section-notify" data-page="operations" class="card span-all">
       <h2>后台控制端引导</h2>
@@ -3145,6 +3145,12 @@ async function refreshWhitelist() {
   } catch {}
 }
 
+function resetResultText(result, successText) {
+  const parts = result.ok ? [successText] : ['❌ ' + (result.error || '重置失败'), ...(result.errors || [])];
+  if (result.backupDir) parts.push('备份：' + result.backupDir);
+  return parts.join('；');
+}
+
 async function refreshSessions() {
   try {
     const s = await api('/api/sessions');
@@ -3162,7 +3168,7 @@ async function refreshSessions() {
     box.querySelectorAll('[data-reset-key]').forEach(btn => btn.addEventListener('click', async () => {
       if (!confirm('确定清除该会话的上下文？下次消息将开新会话。')) return;
       const r = await api('/api/session/reset', 'POST', { key: btn.dataset.resetKey });
-      alert(r.ok ? '✅ 已清除上下文' : ('❌ ' + (r.error || '失败')));
+      alert(resetResultText(r, '✅ 已清除上下文'));
       refreshSessions();
     }));
   } catch {}
@@ -3335,9 +3341,9 @@ document.getElementById('restartBtn').addEventListener('click', async () => {
   document.getElementById('restartMsg').textContent = r.message || '正在重启…';
 });
 document.getElementById('clearWsBtn').addEventListener('click', async () => {
-  if (!confirm('确定清空整个「QQ 聊天」工作区？\n将归档全部 QQ 会话、清除所有上下文映射、清空活动日志。\n此操作不可撤销。')) return;
+  if (!confirm('确定清空整个「QQ 聊天」工作区？\n将先备份状态，再停止并归档全部 QQ 会话、清除上下文映射；活动日志保留。')) return;
   const r = await api('/api/workspace/reset', 'POST', {});
-  document.getElementById('clearWsMsg').textContent = r.ok ? (`✅ 已归档 ${r.archivedCount} 个会话，工作区已清空`) : ('❌ ' + (r.error || '失败'));
+  document.getElementById('clearWsMsg').textContent = resetResultText(r, `✅ 已归档 ${r.archivedCount} 个会话，工作区已清空`);
   document.getElementById('clearWsMsg').className = r.ok ? 'meta ok' : 'meta err';
   refreshSessions(); refresh();
 });
@@ -4018,11 +4024,13 @@ document.getElementById('v2ResetBtn').addEventListener('click', async () => {
   if (!confirm('确定重置二代 AI 状态？\n将清空所有二代会话、唤醒配置、未读消息和定时器；工具调用日志会保留。')) return;
   const r = await api('/api/socialV2/reset', 'POST', {});
   const msg = document.getElementById('v2ConfigMsg');
-  msg.textContent = r.ok ? '✅ 已重置二代状态' : ('❌ ' + (r.error || '失败'));
+  msg.textContent = resetResultText(r, '✅ 已重置二代状态');
   msg.className = r.ok ? 'meta ok' : 'meta err';
   refreshV2Activity();
-  document.getElementById('v2AllStatesOutput').textContent = '（全部会话状态：空）';
-  document.getElementById('v2StateOutput').textContent = '（空）';
+  if (r.ok) {
+    document.getElementById('v2AllStatesOutput').textContent = '（全部会话状态：空）';
+    document.getElementById('v2StateOutput').textContent = '（空）';
+  }
 });
 document.getElementById('v2StateView').addEventListener('click', viewV2State);
 document.getElementById('v2ForceWake').addEventListener('click', async () => {

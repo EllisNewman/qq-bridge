@@ -7,6 +7,28 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+/** Offline writers and bridge startup check each other's locks after claiming
+ * their own lock, closing the check-then-create race. Never steal stale locks. */
+export function acquireOfflineStateLock(stateDir) {
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const lock = path.join(stateDir, 'memory-maintenance.lock');
+  let owned = false;
+  const release = () => {
+    if (owned) { fs.unlinkSync(lock); owned = false; }
+  };
+  try {
+    fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+    owned = true;
+    for (const name of ['bridge.lock', 'memory-restore.lock']) {
+      if (fs.existsSync(path.join(stateDir, name))) throw new Error(`检测到 ${name}：请先停止 bridge 或等待离线维护结束；确认停止后再处理残留锁`);
+    }
+    return release;
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
 export function readJsonSafe(file, fallback, required = false) {
   try {
     let text = fs.readFileSync(file, 'utf8');

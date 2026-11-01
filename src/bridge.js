@@ -1073,12 +1073,19 @@ function consolePortInUse() {
 }
 
 function acquireLock() {
-  if (fs.existsSync(path.join(STATE_DIR, 'memory-restore.lock'))) throw new Error('记忆恢复进行中或残留恢复锁，请先检查恢复结果');
+  const assertNoMaintenance = () => {
+    if (['memory-restore.lock', 'memory-maintenance.lock'].some(name => fs.existsSync(path.join(STATE_DIR, name)))) {
+      throw new Error('离线记忆维护进行中或残留维护锁，请先检查维护结果');
+    }
+  };
+  assertNoMaintenance();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   // 原子创建锁文件：把 PID 一次性写入（flag 'wx'），避免“先建空文件再写 PID”的窗口被第二个进程当作过期锁偷走。
   const tryCreate = () => {
     try {
       fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx', mode: 0o600 });
+      try { assertNoMaintenance(); }
+      catch (error) { fs.unlinkSync(LOCK_FILE); throw error; }
       return true;
     } catch (error) {
       if (error?.code === 'EEXIST') return false;
@@ -1426,6 +1433,9 @@ async function main() {
   let memoryDistillerTurns = 0;
   // M5：本回合被主动呈现的想法（key -> {ids, reason, at}），供发送/回合结束消费。
   const surfacedThoughts = new Map();
+  // Inbound messages wait until a reset commits or fails. Agent actions and new
+  // session creation are refused while the old mapping is being controlled.
+  const conversationResets = new Map();
   const distillTimers = new Map();
   const distillIdleTimers = new Map();
   const distillRunning = new Set();
@@ -2731,7 +2741,7 @@ async function main() {
     void (async () => {
       try { await withTimeout(api.stopSessionWork(sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); }
       catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；本地映射已撤销，请在 DSH 检查旧任务`); }
-      try { await withTimeout(api.workspace.archiveSession({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); }
+      try { unwrap(await withTimeout(api.workspace.archiveSession({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'), 'archiveSession'); }
       catch (error) { log(`归档失效会话失败 ${key}: ${error?.message ?? error}`); }
     })();
   }
@@ -2805,16 +2815,16 @@ async function main() {
 
   /**
    * M3：完整清掉一个 key 的桥接侧运行态（映射/定时器/队列/轻量记忆/token），
-   * 并按需停止 + 归档 DSH 会话。与 /api/session/reset 的区别：这里是可 await 的，
-   * 且会返回归档结果与错误，供 performMemoryReset 汇总。
+   * 并按需停止 + 归档 DSH 会话。手动重置统一由 resetConversationSet 先备份、
+   * 检查远端成功后再调用这里提交本地清理。
    */
-  async function clearConversationSession(key, { stopWork = true } = {}) {
+  async function clearConversationSession(key, { stopWork = true, expectedSessionId = state.sessions[key] ?? null } = {}) {
     const oldSessionId = state.sessions[key] ?? null;
+    if (oldSessionId !== expectedSessionId) throw new Error('会话已变化，请重新执行重置');
     const errors = [];
     if (oldSessionId && stopWork) {
       // Memory reset discards handoff; ordinary session reset retains it separately.
-      await withTimeout(api.stopSessionWork(oldSessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork');
-      await withTimeout(api.workspace.archiveSession({ sessionId: oldSessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession');
+      await stopAndArchiveResetSession(oldSessionId);
       if (state.sessions[key] !== oldSessionId) throw new Error('会话已变化，请重新执行重置');
     }
     sessionEpoch += 1;
@@ -2867,6 +2877,110 @@ async function main() {
     saveSocialV2State();
     saveState();
     return { key, archived: oldSessionId, errors };
+  }
+
+  async function stopAndArchiveResetSession(sessionId, progress = {}) {
+    const stopped = await withTimeout(api.stopSessionWork(sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork');
+    // stopSessionWork normally unwraps its own RPCs and returns {removed}.
+    if (stopped?.result) unwrap(stopped, 'stopSessionWork');
+    progress.stoppedCount = (progress.stoppedCount || 0) + 1;
+    unwrap(await withTimeout(api.workspace.archiveSession({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'), 'archiveSession');
+    progress.archivedCount = (progress.archivedCount || 0) + 1;
+  }
+
+  function conversationResetKeys() {
+    return [...new Set([...Object.keys(state.sessions), ...Object.keys(state.sessionPolicies),
+      ...socialV2.conversations.keys(), ...social.states.keys(), ...social.recentMessages.keys(),
+      ...queued.keys(), ...pending.keys(), ...promptQueues.keys(), ...sessionPromises.keys()])];
+  }
+
+  function resetContextSession(key, label) {
+    const expectedSessionId = state.sessions[key];
+    return enqueueDistill(() => {
+      if (!expectedSessionId || state.sessions[key] !== expectedSessionId) {
+        throw Object.assign(new Error('会话已变化，请刷新后重新执行重置'), { statusCode: 409 });
+      }
+      return resetConversationSet([key], { label });
+    });
+  }
+
+  // Called on the distill queue. All manual reset entry points share the same
+  // backup and remote-success boundary; only memory reset rotates archive conv.
+  async function resetConversationSet(keys, { label = 'context-reset', handoff = true,
+    rotateArchive = false, includeLongTerm = false, includeArchive = false,
+    extraSessionIds = [], atomic = false } = {}) {
+    keys = [...new Set(keys)];
+    const result = { keys, backupDir: null, archived: [], removed: [], errors: [], stoppedCount: 0, archivedCount: 0 };
+    if (!keys.length && !extraSessionIds.length) return result;
+    const expected = new Map(keys.map(key => [key, state.sessions[key] ?? null]));
+    let release;
+    const done = new Promise(resolve => { release = resolve; });
+    for (const key of keys) conversationResets.set(key, done);
+    try {
+      if (!stateWritable) throw new Error('会话状态只读，已取消重置');
+      saveState();
+      saveSocialV2State({ strict: true });
+      archiveStore.flushAll({ strict: true });
+      result.backupDir = createBackup({ stateDir: STATE_DIR, includeArchive, label }).dir;
+      const prepared = [];
+      const remoteIds = new Set(expected.values());
+      remoteIds.delete(null);
+      for (const sessionId of new Set(extraSessionIds)) {
+        if (remoteIds.has(sessionId)) continue;
+        try { await stopAndArchiveResetSession(sessionId, result); }
+        catch (error) { result.errors.push(`${sessionId}: ${error?.message ?? error}`); }
+      }
+      for (const key of keys) {
+        const sessionId = expected.get(key);
+        try {
+          let handoffText = null;
+          if (handoff && sessionId && memoryScopeForKey(key)) {
+            const recent = (socialV2.conversations.get(key)?.recentMessages || [])
+              .map(m => ({ text: m.text, dir: m.isSelf ? 'out' : 'in' }));
+            const deadline = Date.now() + 20000;
+            try {
+              handoffText = await withTimeout(runHandoffQueued(key, sessionId,
+                { reason: label, deadline, persist: false, fallbackMessages: recent }), 20000, 'handoff');
+            } catch { if (recent.length) handoffText = fallbackHandoff(recent); }
+          }
+          if (sessionId) await stopAndArchiveResetSession(sessionId, result);
+          if ((state.sessions[key] ?? null) !== sessionId) throw new Error('会话已变化，请重新执行重置');
+          prepared.push({ key, sessionId, handoffText });
+        } catch (error) { result.errors.push(`${key}: ${error?.message ?? error}`); }
+      }
+      if (atomic && result.errors.length) return result;
+      // Recheck every mapping after the asynchronous control phase.
+      if (atomic && prepared.some(item => (state.sessions[item.key] ?? null) !== item.sessionId)) {
+        result.errors.push('会话已变化，请重新执行重置');
+        return result;
+      }
+      for (const { key, sessionId, handoffText } of prepared) {
+        try {
+          await clearConversationSession(key, { stopWork: false, expectedSessionId: sessionId });
+          if (sessionId) result.archived.push(sessionId);
+          const info = archiveScopeForKey(key);
+          if (info && rotateArchive) {
+            archiveStore.rotateConv(info.scope);
+            if (includeLongTerm || includeArchive) result.removed.push({ key,
+              ...removeScopeFiles({ stateDir: STATE_DIR, scope: info.scope, includeLongTerm, includeArchive }) });
+            if (includeArchive) archiveStore.invalidate(info.scope);
+            memoryStore.invalidate(info.scope);
+          }
+          if (info && handoffText) memoryStore.setHandoff(info.scope, handoffText, sessionId);
+        } catch (error) { result.errors.push(`${key}: ${error?.message ?? error}`); }
+      }
+      saveState();
+      saveSocialV2State({ strict: true });
+      archiveStore.flushAll({ strict: true });
+      return result;
+    } catch (error) {
+      if (!result.backupDir) throw error;
+      result.errors.push(String(error?.message ?? error));
+      return result;
+    } finally {
+      for (const key of keys) if (conversationResets.get(key) === done) conversationResets.delete(key);
+      release();
+    }
   }
 
   function reconcileSessionPolicies() {
@@ -3212,6 +3326,7 @@ async function main() {
     };
     const agentTokenOk = (key, token) => {
       const canonical = canonicalV2Key(key);
+      if (conversationResets.has(canonical ?? key)) return false;
       const st = socialV2.conversations.get(canonical ?? key);
       return !!st && !!st.agentToken && tokenEq(token, st.agentToken);
     };
@@ -4652,45 +4767,10 @@ async function main() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/reset') {
-          sessionEpoch++;
-          sessionPromises.clear();
-          clearAllSocialV2Timers();
-          drainAllPromptQueues('二代状态已重置');
-          for (const key of new Set([...socialV2.conversations.keys(), ...listArchiveScopes(STATE_DIR)])) {
-            const sid = state.sessions[key];
-            if (sid) {
-              delete state.sessions[key];
-              // 与 retireSession / session-reset / workspace-reset 一致：先让 DSH 停下这个会话的活。
-              // 少了这一步，DSH 会继续跑完在途/排队的 turn（token 照烧、副作用照做），
-              // 而桥接这边已经把所有映射删掉 —— 输出被静默丢弃，agentToken 也已轮换（它的 MCP 发送全部 403）。
-              stopRetiredSessionWork(sid, key);
-              sessionModels.delete(sid);
-              modelAppliedSessions.delete(sid);
-              reverse.delete(sid);
-              collectors.delete(sid);
-              v2TurnStartAt.delete(sid);
-              turnLeaseNoted.delete(sid);
-              toolCallNames.delete(sid);
-              pendingSendToolCalls.delete(sid);
-              sendToolSucceededSessions.delete(sid);
-              // 订阅也要退掉，否则它会在每次重连时被重新 follow 并重发整份快照。
-              api.events.forget?.(sid);
-            }
-            delete state.sessionPolicies[key];
-            forgetAgentToken(key);
-            socialV2.conversations.delete(key);
-            seenForwardIds.delete(key);
-          }
-          saveState();
-          pendingWakeKeys.clear();
-          clearAllPendingWakeLeases();
-          wakeConfigUpdatedKeys.clear();
-          markReadCalledKeys.clear();
-          wakeConfigMissCount.clear();
-          socialV2.paused = false;
-          try { atomicWriteJson(SOCIAL_V2_FILE, { conversations: {} }); } catch (error) { log('重置二代状态：写空状态文件失败:', error?.message ?? error); }
-          log('控制台：二代 AI 状态已重置（会话、定时器、唤醒配置已清空，工具日志保留）');
-          sendJson({ ok: true });
+          const result = await enqueueDistill(() => resetConversationSet(conversationResetKeys(),
+            { label: 'social-v2-reset', atomic: true }));
+          if (!result.errors.length) { socialV2.paused = false; saveSocialV2State({ strict: true }); }
+          sendJson({ ok: result.errors.length === 0, ...result }, result.errors.length ? 503 : 200);
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/state') {
@@ -7360,143 +7440,33 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '');
           if (!key || !state.sessions[key]) { sendJson({ ok: false, error: '会话不存在' }, 404); return; }
-          sessionEpoch++;
-          const oldSessionId = state.sessions[key];
-          delete state.sessions[key];
-          modelAppliedSessions.delete(oldSessionId);
-          // 权限元数据必须与映射一起删除，否则会永久残留在 sessions.json 里。
-          delete state.sessionPolicies[key];
-          reverse.delete(oldSessionId);
-          collectors.delete(oldSessionId);
-          sendToolSucceededSessions.delete(oldSessionId);
-          pendingSendToolCalls.delete(oldSessionId);
-          v2TurnStartAt.delete(oldSessionId);
-          turnLeaseNoted.delete(oldSessionId);
-          toolCallNames.delete(oldSessionId);
-          const pe = pending.get(key);
-          if (pe) {
-            clearTimeout(pe.timer);
-            cancelPendingEntry(pe).catch(() => {});
-          }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          social.silentTurns.delete(oldSessionId);
-          social.exitingSessions.delete(oldSessionId);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          forgetAgentToken(key);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
-          saveSocialV2State();
-          saveState();
-          // 归档只隐藏会话，不终止 DSH 侧排队的工作；先写交接摘要，再清队列并取消当前回合。
-          try { await runHandoff(key, oldSessionId, { reason: 'session-reset' }); }
-          catch (error) { log(`[memory] handoff 失败 ${key}：${error?.message ?? error}`); }
-          try { await withTimeout(api.stopSessionWork(oldSessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-          try { await withTimeout(api.workspace.archiveSession({ sessionId: oldSessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
-          log(`控制台：已清除会话上下文 ${key}（旧会话 ${oldSessionId} 已停止并归档）`);
-          sendJson({ ok: true, key, archived: oldSessionId });
+          const result = await resetContextSession(key, 'session-reset');
+          sendJson({ ...result, ok: result.errors.length === 0, key, archived: result.archived[0] ?? null },
+            result.errors.length ? 503 : 200);
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
           const body = await readBody();
-          const dryRun = body.dryRun === true;
-          const errors = [];
-          const candidates = [];
-          let list;
-          try {
-            list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
-          } catch (error) {
-            // DSH 不可用时直接清桥接状态会留下「映射没了、会话还在跑」的黑洞；宁可失败。
-            sendJson({ ok: false, error: `无法列出 DSH 会话，已取消清空：${error?.message ?? error}` }, 503);
-            return;
-          }
-          const seen = new Set();
-          for (const item of list.items ?? []) {
-            if (isQqSessionCandidate(item, { sessionCwd: cfg.sessionCwd, stateDir: STATE_DIR })) {
-              candidates.push({ sessionId: item.sessionId, cwd: item.cwd ?? null, agentPreset: item.agentPreset ?? null });
-              seen.add(item.sessionId);
+          const result = await enqueueDistill(async () => {
+            let list;
+            try {
+              list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
+            } catch (error) {
+              return { ok: false, error: `无法列出 DSH 会话，已取消清空：${error?.message ?? error}`, errors: [String(error?.message ?? error)] };
             }
-          }
-          // 映射里有、但 session/list 没返回的（例如刚归档/刚创建）也要停掉，避免漏网。
-          for (const [key, sessionId] of Object.entries(state.sessions || {})) {
-            if (!sessionId || seen.has(sessionId)) continue;
-            candidates.push({ sessionId, cwd: null, agentPreset: null, key });
-            seen.add(sessionId);
-          }
-          if (dryRun) {
-            sendJson({ ok: true, dryRun: true, candidates, count: candidates.length, errors });
-            return;
-          }
-          sessionEpoch++;
-          let archivedCount = 0;
-          let stoppedCount = 0;
-          for (const item of candidates) {
-            try { await withTimeout(api.stopSessionWork(item.sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); stoppedCount += 1; }
-            catch (error) { errors.push(`停止 ${item.sessionId} 失败：${error?.message ?? error}`); }
-            try { await withTimeout(api.workspace.archiveSession({ sessionId: item.sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); archivedCount += 1; }
-            catch (error) { errors.push(`归档 ${item.sessionId} 失败：${error?.message ?? error}`); }
-          }
-          if (errors.length) {
-            sendJson({ ok: false, error: '停止或归档失败，已保留桥接状态', candidates, archivedCount, stoppedCount, errors }, 503);
-            return;
-          }
-          for (const entry of pending.values()) {
-            clearTimeout(entry.timer);
-            cancelPendingEntry(entry).catch(() => {});
-          }
-          pending.clear();
-          queued.clear();
-          queuedHintAt.clear();
-          sessionPromises.clear();
-          drainAllPromptQueues('工作区已清空');
-          social.states.clear();
-          social.recentMessages.clear();
-          messageMediaStore.clear();
-          seenForwardIds.clear();
-          social.pendingSummaries.clear();
-          social.silentContext.clear();
-          social.silentTurns.clear();
-          social.exitingSessions.clear();
-          slangWindows.clear();
-          slangExtractionCooldowns.clear();
-          slangSubmitTimes.clear();
-          cancelAllSocialTimers();
-          clearAllSocialV2Timers();
-          // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
-          surfacedThoughts.clear();
-          socialV2.conversations.clear();
-          CONVERSATION_TOKENS.clear();
-          KNOWN_AGENT_TOKENS.clear();
-          saveSocialV2State();
-          state.sessions = {};
-          state.sessionPolicies = {};
-          reverse.clear();
-          collectors.clear();
-          sendToolSucceededSessions.clear();
-          pendingSendToolCalls.clear();
-          v2TurnStartAt.clear();
-          toolCallNames.clear();
-          saveState();
-          try { fs.writeFileSync(ACTIVITY_LOG, ''); } catch {}
-          log(`控制台：已清空 QQ 聊天工作区（候选 ${candidates.length}，停止 ${stoppedCount}，归档 ${archivedCount}${errors.length ? `，错误 ${errors.length}` : ''}；映射与活动日志已清空）`);
-          sendJson({ ok: true, dryRun: false, candidates: candidates.length, archivedCount, stoppedCount, errors });
+            const candidates = (list.items ?? []).filter(item => isQqSessionCandidate(item,
+              { sessionCwd: cfg.sessionCwd, stateDir: STATE_DIR }));
+            const seen = new Set(candidates.map(item => item.sessionId));
+            for (const [key, sessionId] of Object.entries(state.sessions)) {
+              if (!seen.has(sessionId)) { candidates.push({ key, sessionId }); seen.add(sessionId); }
+            }
+            if (body.dryRun === true) return { ok: true, dryRun: true, candidates, count: candidates.length, errors: [] };
+            const reset = await resetConversationSet(conversationResetKeys(), { label: 'workspace-reset',
+              atomic: true, extraSessionIds: candidates.map(item => item.sessionId) });
+            // Keep the audit log; the reset backup covers structured state, not logs.
+            return { ...reset, ok: reset.errors.length === 0, dryRun: false, candidates: candidates.length };
+          });
+          sendJson(result, result.ok ? 200 : 503);
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
@@ -8315,7 +8285,7 @@ async function main() {
     const policy = sessionPolicy(key);
     const sessionId = state.sessions[key];
     return () => {
-      if (!isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
+      if (conversationResets.has(key) || !isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
           || (sessionId && state.sessions[key] !== sessionId)) {
         throw new Error('发送已取消：会话、模式或白名单已变化');
       }
@@ -8390,6 +8360,7 @@ async function main() {
   }
 
   async function ensureSession(key) {
+    if (conversationResets.has(key)) throw new Error('会话正在重置，请稍后重试');
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
@@ -8406,7 +8377,7 @@ async function main() {
           log(`会话 ${key} 在 DSH 侧已不存在，退役本地映射并在本次调用中重建`);
           retireSession(key, { handoff: false, reason: 'not-found' });
         } else {
-          if (epoch !== sessionEpoch || !isCurrentSession(key, existing)) throw new Error('会话创建期间已重置或权限已变化');
+          if (conversationResets.has(key) || epoch !== sessionEpoch || !isCurrentSession(key, existing)) throw new Error('会话创建期间已重置或权限已变化');
           return existing;
         }
       }
@@ -8458,7 +8429,7 @@ async function main() {
       // 新版 DSH 事件流需要显式 follow 该会话，否则收不到 turn 事件。
       api.events.follow(sessionId);
       // reset/清空工作区期间创建完成：丢弃，防止旧会话复活
-      if (epoch !== sessionEpoch || policy !== sessionPolicy(key) || !isSessionAllowedInCurrentMode(key)) {
+      if (conversationResets.has(key) || epoch !== sessionEpoch || policy !== sessionPolicy(key) || !isSessionAllowedInCurrentMode(key)) {
         log(`会话创建期间发生 reset，丢弃 ${key} 的新会话（${sessionId}）`);
         try { await withTimeout(api.workspace.archiveSession({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
         throw new Error('会话创建期间已重置，丢弃新会话');
@@ -8963,7 +8934,7 @@ async function main() {
     }
   }
 
-  function saveSocialV2State() {
+  function saveSocialV2State({ strict = false } = {}) {
     try {
       const obj = { paused: socialV2.paused, conversations: Object.create(null) };
       for (const [key, st] of socialV2.conversations) {
@@ -9001,6 +8972,7 @@ async function main() {
       atomicWriteJson(SOCIAL_V2_FILE, obj);
     } catch (error) {
       log('保存 socialV2 状态失败:', error?.message ?? error);
+      if (strict) throw error;
     }
   }
 
@@ -9370,38 +9342,10 @@ async function main() {
     if (!keys.length) {
       return { scope, keys, dryRun: false, backupDir: null, archived: [], removed: [], errors: [] };
     }
-    saveState();
-    saveSocialV2State();
-    archiveStore.flushAll();
-    const backup = createBackup({ stateDir: STATE_DIR, includeArchive, label: `reset:${scope}` });
-    const archived = [];
-    const removed = [];
-    const errors = [];
-    for (const key of keys) {
-      try {
-        const result = await clearConversationSession(key);
-        if (result.archived) archived.push(result.archived);
-        errors.push(...result.errors.map((e) => `${key}: ${e}`));
-        const info = archiveScopeForKey(key);
-        if (info) {
-          archiveStore.rotateConv(info.scope);
-          if (includeLongTerm || includeArchive) {
-            removed.push({ key, ...removeScopeFiles({ stateDir: STATE_DIR, scope: info.scope, includeLongTerm, includeArchive }) });
-          }
-          // 关键：memoryStore 有进程内缓存；删文件/换 conv 后必须让下一次 load 重新读盘，
-          // 否则本次进程还会继续注入已被删除的 facts。
-          if (includeArchive) archiveStore.invalidate(info.scope);
-          memoryStore.invalidate(info.scope);
-        }
-      } catch (error) {
-        errors.push(`${key}: ${error?.message ?? error}`);
-      }
-    }
-    saveState();
-    saveSocialV2State();
-    archiveStore.flushAll();
-    log(`控制台：记忆重置 scope=${scope} keys=${keys.length} backup=${backup.dir}${errors.length ? ` errors=${errors.length}` : ''}`);
-    return { scope, keys, dryRun: false, backupDir: backup.dir, archived, removed, errors };
+    const result = await resetConversationSet(keys, { label: `reset:${scope}`, handoff: false,
+      rotateArchive: true, includeLongTerm, includeArchive });
+    log(`控制台：记忆重置 scope=${scope} keys=${keys.length} backup=${result.backupDir} errors=${result.errors.length}`);
+    return { scope, dryRun: false, ...result };
   }
 
   function distillConfig() {
@@ -9599,7 +9543,7 @@ async function main() {
     }
   }
 
-  async function runHandoffQueued(key, sessionId, { reason = 'retire', deadline } = {}) {
+  async function runHandoffQueued(key, sessionId, { reason = 'retire', deadline, persist = true, fallbackMessages = [] } = {}) {
     const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) throw new Error('handoff deadline'); return ms; };
     remaining();
     if (!sessionId || !key.startsWith('private:')) return null;
@@ -9614,7 +9558,8 @@ async function main() {
         page = unwrap(await withTimeout(api.sessions.history({ sessionId, maxMessages: 60 }), remaining(), 'session.history'), 'session.history');
       } catch {}
     }
-    const messages = extractPageMessages(page);
+    const extracted = extractPageMessages(page);
+    const messages = extracted.length ? extracted : fallbackMessages;
     let text = '';
     if (messages.length && d.enabled) {
       try {
@@ -9626,8 +9571,8 @@ async function main() {
     if (!text) text = fallbackHandoff(messages);
     if (!text) return null;
     remaining();
-    memoryStore.setHandoff(scope, text, sessionId);
-    log(`[memory] handoff 已写入 ${key}（${reason}，${messages.length} 条消息）`);
+    if (persist) memoryStore.setHandoff(scope, text, sessionId);
+    log(`[memory] handoff ${persist ? '已写入' : '已准备'} ${key}（${reason}，${messages.length} 条消息）`);
     return text;
   }
 
@@ -9648,7 +9593,9 @@ async function main() {
       const lastSeq = archiveStore.stats(scope).lastSeq || 0;
       const fromSeq = (Number(snap.summarizedThroughSeq) || 0) + 1;
       if (lastSeq < fromSeq) return { ok: true, skipped: 'no-new-messages', key, scope, fromSeq, lastSeq };
-      let toSeq = Math.min(lastSeq, fromSeq + d.maxMessagesPerRun - 1);
+      // Bound by actual records, not seq arithmetic: failed appends and older
+      // affected releases can leave holes larger than a complete window.
+      let toSeq = lastSeq;
       const entries = selectDistillWindow(archiveStore.readRange(scope, { conv, fromSeq, toSeq, limit: d.maxMessagesPerRun }));
       if (!entries.length) {
         return { ok: false, skipped: 'empty-window', key, scope, fromSeq, toSeq };
@@ -10033,6 +9980,7 @@ async function main() {
 
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
   async function deliverPromptNow(key, promptText, opts = {}) {
+    if (conversationResets.has(key)) return { ok: false, error: '会话正在重置' };
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
     // Recheck queued wakes at dispatch time: no model call while paused/disabled
     // and no reserved2 prompt leaking into an ordinary chat after a mode switch.
@@ -11293,6 +11241,7 @@ async function main() {
   }
 
   async function sendWakePromptV2(key, reason) {
+    if (conversationResets.has(key)) return;
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -11916,6 +11865,7 @@ async function main() {
   // QQ 消息 → DSH prompt
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
+    while (conversationResets.has(key)) await conversationResets.get(key);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
       log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
       return;
@@ -11951,6 +11901,7 @@ async function main() {
     // 引用对象是机器人自己时，视为直接对 AI 说（即使当前文字没有 @/关键词）。
     // 因此必须先解析 quoteTargetIsSelf 再做空文本过滤，避免“只引用不附文”被漏掉。
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
+    while (conversationResets.has(key)) await conversationResets.get(key);
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
@@ -11984,57 +11935,16 @@ async function main() {
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {
-        const old = state.sessions[key];
-        if (old) {
-          sessionEpoch++;
-          delete state.sessions[key];
-          modelAppliedSessions.delete(old);
-          delete state.sessionPolicies[key];
-          reverse.delete(old);
-          collectors.delete(old);
-          sendToolSucceededSessions.delete(old);
-          pendingSendToolCalls.delete(old);
-          v2TurnStartAt.delete(old);
-          turnLeaseNoted.delete(old);
-          toolCallNames.delete(old);
-          social.silentTurns.delete(old);
-          social.exitingSessions.delete(old);
-          const pe = pending.get(key);
-          if (pe) {
-            clearTimeout(pe.timer);
-            cancelPendingEntry(pe).catch(() => {});
+        if (state.sessions[key]) {
+          try {
+            const result = await resetContextSession(key, 'command-reset');
+            await sendToQQ(key, result.errors.length
+              ? '重置失败，请在控制台检查会话状态与备份。'
+              : '已重置会话，下次消息将开新上下文');
+          } catch (error) {
+            log(`命令重置失败 ${key}：${error?.message ?? error}`);
+            await sendToQQ(key, '重置失败，已保留会话状态，请在控制台检查。');
           }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          forgetAgentToken(key);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
-          saveSocialV2State();
-          saveState();
-          // 与 retireSession 一致：先写交接摘要，再终止 DSH 侧排队的工作、归档。
-          try { await runHandoff(key, old, { reason: 'command-reset' }); }
-          catch (error) { log(`[memory] handoff 失败 ${key}：${error?.message ?? error}`); }
-          try { await withTimeout(api.stopSessionWork(old), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-          try { await withTimeout(api.workspace.archiveSession({ sessionId: old }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
-          await sendToQQ(key, '已重置会话，下次消息将开新上下文');
         }
         return;
       }
@@ -12383,6 +12293,8 @@ async function main() {
         sender = await resolveGroupMemberName(Number(id), senderId) || senderId;
       } catch {}
     }
+    while (conversationResets.has(key)) await conversationResets.get(key);
+    if (!modeAllowed(key, kind, id, cfg, currentMode)) return;
     const targetIsSelf = !!targetId && selfId != null && String(targetId) === String(selfId);
     const isOwner = String(senderId) === String(cfg.ownerQQ ?? '');
     const msg = appendSocialV2Poke(key, {

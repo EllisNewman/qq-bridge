@@ -127,6 +127,32 @@ try {
   ok('BOM 容错', () => assert.deepEqual(readJsonSafe(jsonFile, null), { b: 2 }));
   ok('缺失文件 fallback', () => assert.equal(readJsonSafe(path.join(tmp, 'nope.json'), 'fallback'), 'fallback'));
 
+  ok('保留旧代际重启，新的 seq 从 1 开始', () => {
+    const opts = { root: path.join(tmp, 'generations'), metaPath: path.join(tmp, 'generations-meta.json') };
+    let archive = createArchiveStore(opts);
+    for (let i = 0; i < 100; i++) archive.append(scope, { at: Date.UTC(2026, 9, 20), text: 'old' });
+    archive.flushAll();
+    const conv = archive.rotateConv(scope);
+    archive = createArchiveStore(opts);
+    assert.equal(archive.stats(scope).lastSeq, 0);
+    const first = archive.append(scope, { at: Date.UTC(2026, 9, 21), text: 'new' });
+    assert.equal(first.conv, conv);
+    assert.equal(first.seq, 1);
+    assert.equal(archive.readRange(scope, { conv, fromSeq: 1, toSeq: 60 }).length, 1);
+  });
+  ok('按当前代际最大 seq 恢复，兼容跨日和未刷新索引', () => {
+    const opts = { root: path.join(tmp, 'backdated'), metaPath: path.join(tmp, 'backdated-meta.json') };
+    let archive = createArchiveStore(opts);
+    for (let i = 0; i < 100; i++) archive.append(scope, { at: Date.UTC(2026, 9, 23), text: 'old future day' });
+    archive.flushAll();
+    const conv = archive.rotateConv(scope);
+    archive.append(scope, { at: Date.UTC(2026, 9, 22), text: 'first' });
+    archive.append(scope, { at: Date.UTC(2026, 9, 21), text: 'second backdated' });
+    archive = createArchiveStore(opts);
+    assert.equal(archive.getMeta(scope).conv, conv);
+    assert.equal(archive.stats(scope).lastSeq, 2);
+    assert.equal(archive.append(scope, { text: 'third' }).seq, 3);
+  });
   console.log(`\n[archive] 全部通过：${passed} 项`);
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });

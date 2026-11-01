@@ -212,8 +212,9 @@ export function createArchiveStore(options = {}) {
     };
   }
 
-  function lastSeqOnDisk(scope) {
+  function lastSeqOnDisk(scope, conv) {
     const files = listDayFiles(scope);
+    let max = 0;
     for (let i = files.length - 1; i >= 0; i -= 1) {
       const full = path.join(scopeDir(scope), files[i]);
       let text = '';
@@ -225,10 +226,10 @@ export function createArchiveStore(options = {}) {
       const lines = text.split('\n');
       for (let j = lines.length - 1; j >= 0; j -= 1) {
         const e = parseLine(lines[j]);
-        if (e && Number.isSafeInteger(e.seq)) return e.seq;
+        if (e?.conv === conv && Number.isSafeInteger(e.seq)) max = Math.max(max, e.seq);
       }
     }
-    return 0;
+    return max;
   }
 
   function ensureScope(scope) {
@@ -251,8 +252,9 @@ export function createArchiveStore(options = {}) {
       metaDirty = true;
     }
     const index = loadIndex(scope) || rebuildIndex(scope);
-    const maxIndexSeq = index.days.reduce((m, d) => Math.max(m, Number(d.lastSeq) || 0), 0);
-    const recovered = Math.max(Number(entry.archiveSeq) || 0, maxIndexSeq, lastSeqOnDisk(scope));
+    // Legacy day indexes combine generations. Their lastSeq cannot recover a
+    // particular conv (a retained, older generation may have a much larger seq).
+    const recovered = Math.max(Number(entry.archiveSeq) || 0, lastSeqOnDisk(scope, entry.conv));
     if (recovered !== (Number(entry.archiveSeq) || 0)) {
       entry.archiveSeq = recovered;
       entry.updatedAt = now();
@@ -341,19 +343,23 @@ export function createArchiveStore(options = {}) {
     saveMeta();
   }
 
-  function flushAll() {
+  function flushAll({ strict = false } = {}) {
+    const errors = [];
     for (const scope of scopes.keys()) {
       try {
         flush(scope);
       } catch (error) {
         log(`[archive] flush 失败 ${scope}: ${error?.message ?? error}`);
+        errors.push(error);
       }
     }
     try {
       saveMeta();
     } catch (error) {
       log(`[archive] meta flush 失败: ${error?.message ?? error}`);
+      errors.push(error);
     }
+    if (strict && errors.length) throw new AggregateError(errors, '归档刷新失败，已取消维护操作');
   }
 
   function readRange(scope, range = {}) {

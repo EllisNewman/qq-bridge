@@ -128,7 +128,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   return {
     scheduleThoughtDueV2, appendSocialV2Poke, markThoughtUsed, dropThought,
     surfaceThoughtsForKey, consumeSurfacedThoughts, finishSurfacedThoughts, privateProactiveBlockReason, runThoughtDueV2,
-    enqueueDistill, runDailyDistill, distillScopeNow, archiveStore, memoryStore,
+    enqueueDistill, runDailyDistill, distillScopeNow, archiveStore, memoryStore, learnerWaiters, acquireLock, resetContextSession,
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,

@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createBackup, listBackups, restoreBackup } from '../src/memory-reset.js';
-import { readJsonSafe } from '../src/state-io.js';
+import { readJsonSafe, acquireOfflineStateLock } from '../src/state-io.js';
 
 function arg(name, fallback = '') {
   const i = process.argv.indexOf(name);
@@ -63,11 +63,12 @@ async function resetViaHttp() {
   if (!res.ok || data.ok === false) process.exit(1);
 }
 
+let release;
 try {
   if (has('--list-backups')) {
     print(listBackups(path.join(stateDir, 'backups')));
   } else if (has('--backup')) {
-    if (fs.existsSync(path.join(stateDir, 'bridge.lock'))) throw new Error('离线备份前请停止 bridge；在线备份由记忆重置流程创建');
+    release = acquireOfflineStateLock(stateDir);
     const result = createBackup({
       stateDir,
       includeArchive: has('--include-archive'),
@@ -75,12 +76,8 @@ try {
     });
     print({ ok: true, dir: result.dir, manifest: result.manifest, pruned: result.pruned });
   } else if (arg('--restore')) {
+    release = acquireOfflineStateLock(stateDir);
     const dir = path.resolve(arg('--restore'));
-    const lock = path.join(stateDir, 'bridge.lock');
-    if (fs.existsSync(lock)) {
-      console.error(`检测到 ${lock}：请先停止 bridge（docker compose stop qq-bridge），确认退出后再运行；残留锁需确认服务已停止后手动清理。`);
-      process.exit(2);
-    }
     let fd;
     try {
       fd = fs.openSync(path.join(stateDir, 'memory-restore.lock'), 'wx', 0o600);
@@ -96,5 +93,5 @@ try {
   }
 } catch (error) {
   console.error(`执行失败：${error?.message ?? error}`);
-  process.exit(1);
-}
+  process.exitCode = 1;
+} finally { release?.(); }

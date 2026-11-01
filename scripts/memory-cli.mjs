@@ -11,7 +11,7 @@
 //   node scripts/memory-cli.mjs import-impressions --key private:928417857 [--dry-run] [--yes]
 import path from 'node:path';
 import { createMemoryStore, scopeForKey } from '../src/memory-store.js';
-import { readJsonSafe } from '../src/state-io.js';
+import { readJsonSafe, acquireOfflineStateLock } from '../src/state-io.js';
 
 function arg(name, fallback = '') {
   const i = process.argv.indexOf(name);
@@ -31,6 +31,8 @@ const command = process.argv[2] && !process.argv[2].startsWith('--') ? process.a
 const key = arg('--key');
 const stateDir = path.resolve(arg('--state-dir', path.join(process.cwd(), 'state')));
 const asJson = has('--json');
+const writes = ['add', 'forget', 'pin'].includes(command)
+  || (command === 'import-impressions' && has('--yes') && !has('--dry-run'));
 
 if (!key) {
   console.error('缺少 --key private:<QQ>');
@@ -44,6 +46,7 @@ if (!info) {
 const store = createMemoryStore({
   root: path.join(stateDir, 'memory'),
   metaPath: path.join(stateDir, 'memory', 'meta.json'),
+  readOnly: !writes,
   log: (line) => console.error(line)
 });
 
@@ -55,7 +58,9 @@ function print(data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
+let release;
 try {
+  if (writes) release = acquireOfflineStateLock(stateDir);
   if (command === 'list') {
     const status = arg('--status', 'active');
     const limit = num('--limit', 50);
@@ -75,7 +80,7 @@ try {
     const text = arg('--text');
     if (!text) {
       console.error('add 需要 --text');
-      process.exit(2);
+      throw Object.assign(new Error('参数无效'), { exitCode: 2 });
     }
     const keywords = arg('--keywords')
       .split(',')
@@ -97,28 +102,28 @@ try {
     }, { source: 'operator' });
     if (!result) {
       console.error('新增失败（text 为空、记忆文件只读，或字段非法）');
-      process.exit(1);
+      throw new Error('命令未完成');
     }
     print({ ok: true, updated: result.updated, fact: result.fact });
   } else if (command === 'forget') {
     const id = arg('--id');
     if (!id) {
       console.error('forget 需要 --id');
-      process.exit(2);
+      throw Object.assign(new Error('参数无效'), { exitCode: 2 });
     }
     print({ ok: store.retract(info.scope, id) });
   } else if (command === 'pin') {
     const id = arg('--id');
     if (!id) {
       console.error('pin 需要 --id');
-      process.exit(2);
+      throw Object.assign(new Error('参数无效'), { exitCode: 2 });
     }
     print({ ok: store.pin(info.scope, id, !has('--unpin')) });
   } else if (command === 'search') {
     const query = arg('--query');
     if (!query) {
       console.error('search 需要 --query');
-      process.exit(2);
+      throw Object.assign(new Error('参数无效'), { exitCode: 2 });
     }
     print(store.search(info.scope, query, num('--limit', 10)));
   } else if (command === 'export') {
@@ -129,7 +134,7 @@ try {
     const st = social?.conversations?.[info.scope];
     if (!st) {
       console.error(`找不到 ${socialPath} 里的 ${info.scope}`);
-      process.exit(1);
+      throw new Error('命令未完成');
     }
     const dryRun = has('--dry-run') || !has('--yes');
     const result = store.importImpressions(info.scope, st.memberImpressions, { dryRun });
@@ -142,9 +147,9 @@ try {
     }
   } else {
     console.error(`未知命令：${command}`);
-    process.exit(2);
+    throw Object.assign(new Error('参数无效'), { exitCode: 2 });
   }
 } catch (error) {
   console.error(`执行失败：${error?.message ?? error}`);
-  process.exit(1);
-}
+  process.exitCode = error.exitCode || 1;
+} finally { release?.(); }
